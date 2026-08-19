@@ -252,11 +252,7 @@ class DiskScanManager: ObservableObject {
             set timeout 15
             spawn ssh -o StrictHostKeyChecking=no -p \(port) \(host.username)@\(host.ip) "sudo -S smartctl --all --json \(devicePath) || smartctl --all --json \(devicePath) || true"
             expect {
-                "password:" {
-                    send "\(host.password)\\r"
-                    exp_continue
-                }
-                "password for" {
+                "ssword" {
                     send "\(host.password)\\r"
                     exp_continue
                 }
@@ -317,11 +313,7 @@ class DiskScanManager: ObservableObject {
             set timeout 15
             spawn ssh -o StrictHostKeyChecking=no -p \(portArg) \(user)@\(ip) "sudo -S smartctl --scan --json || smartctl --scan --json || lsblk -d -o NAME -n || true"
             expect {
-                "password:" {
-                    send "\(pass)\\r"
-                    exp_continue
-                }
-                "password for" {
+                "ssword" {
                     send "\(pass)\\r"
                     exp_continue
                 }
