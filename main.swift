@@ -820,14 +820,8 @@ struct DiskDetailView: View {
                                 .fontWeight(.bold)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
-                                .background(
-                                    diagnosis.status == .healthy ? Color.green.opacity(0.2) : 
-                                    (diagnosis.status == .warning ? Color.orange.opacity(0.2) : Color.red.opacity(0.2))
-                                )
-                                .foregroundColor(
-                                    diagnosis.status == .healthy ? .green : 
-                                    (diagnosis.status == .warning ? .orange : .red)
-                                )
+                                .background(diagnosis.strokeColor)
+                                .foregroundColor(diagnosis.color)
                                 .cornerRadius(5)
                         }
                     }
@@ -1194,17 +1188,17 @@ struct RealMetricsTab: View {
                     .width(min: 150, max: 220)
                     
                     TableColumn("Value") { attr in
-                        Text(attr.value != nil ? "\(attr.value!)" : "-")
+                        Text(attr.value.map { "\($0)" } ?? "-")
                     }
                     .width(min: 40, max: 60)
                     
                     TableColumn("Worst") { attr in
-                        Text(attr.worst != nil ? "\(attr.worst!)" : "-")
+                        Text(attr.worst.map { "\($0)" } ?? "-")
                     }
                     .width(min: 40, max: 60)
                     
                     TableColumn("Threshold") { attr in
-                        Text(attr.threshold != nil ? "\(attr.threshold!)" : "-")
+                        Text(attr.threshold.map { "\($0)" } ?? "-")
                     }
                     .width(min: 40, max: 60)
                     
