@@ -506,17 +506,28 @@ struct RealOverviewTab: View {
                     .padding(.top, 5)
                 } else {
                     GridRow {
-                        Text("USB Access Status:")
+                        Text("SMART Status:")
                             .fontWeight(.semibold)
-                        Text("Restricted (No root privileges)")
-                            .foregroundColor(.red)
+                        Text("Telemetry Blocked")
+                            .foregroundColor(.orange)
+                    }
+                    
+                    GridRow {
+                        Text("USB Connection:")
+                            .fontWeight(.semibold)
+                        Text("Unauthorized / Restricted Bridge")
+                            .foregroundColor(.orange)
                     }
                     
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("Detailed S.M.A.R.T. telemetry is restricted on external USB drives by macOS security policies.")
+                        Text("✓ Password accepted. Raw connection established.")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                            .fontWeight(.semibold)
+                        Text("However, this specific USB enclosure's bridge chip does not translate NVMe S.M.A.R.T. commands under macOS.")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        Text("Please enter your Mac password when prompted to authorize raw hardware communication.")
+                        Text("To read telemetry from this drive, connect it via a Thunderbolt port/enclosure, or use a Linux/Windows host.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .italic()
