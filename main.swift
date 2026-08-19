@@ -101,24 +101,44 @@ class DiskScanManager: ObservableObject {
     }
     
     func refreshDiskList() {
-        let fileManager = FileManager.default
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        task.arguments = ["list", "physical"]
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        
         do {
-            let devContents = try fileManager.contentsOfDirectory(atPath: "/dev")
-            let diskRegex = try NSRegularExpression(pattern: "^disk\\d+$")
-            let physicalDisks = devContents.filter { item in
-                let range = NSRange(location: 0, length: item.utf16.count)
-                return diskRegex.firstMatch(in: item, options: [], range: range) != nil
-            }.map { "/dev/\($0)" }.sorted()
+            try task.run()
+            task.waitUntilExit()
             
-            self.detectedDisks = physicalDisks.map { path in
-                let isMain = path == "/dev/disk0"
-                return StorageDevice(
-                    path: path,
-                    name: isMain ? "Macintosh SSD (\(path))" : "External USB Drive (\(path))",
-                    size: isMain ? "Internal Health Check" : "External Health Check",
-                    isRemote: false,
-                    address: nil
-                )
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8) {
+                let lines = output.components(separatedBy: .newlines)
+                var physicalPaths: [String] = []
+                for line in lines {
+                    if line.hasPrefix("/dev/disk") {
+                        if let firstSpace = line.firstIndex(of: " ") {
+                            let path = String(line[..<firstSpace])
+                            physicalPaths.append(path)
+                        }
+                    }
+                }
+                
+                if physicalPaths.isEmpty {
+                    physicalPaths = ["/dev/disk0"]
+                }
+                
+                self.detectedDisks = physicalPaths.map { path in
+                    let isMain = path == "/dev/disk0"
+                    return StorageDevice(
+                        path: path,
+                        name: isMain ? "Macintosh SSD (\(path))" : "External USB Drive (\(path))",
+                        size: isMain ? "Internal Health Check" : "External Health Check",
+                        isRemote: false,
+                        address: nil
+                    )
+                }
             }
         } catch {
             self.detectedDisks = [StorageDevice(path: "/dev/disk0", name: "Macintosh SSD (/dev/disk0)", size: "Internal Health Check", isRemote: false, address: nil)]
