@@ -1,0 +1,7 @@
+# Build products
+SmartMac
+SmartMac.app/
+
+# User Specific
+.DS_Store
+.swiftpm/
