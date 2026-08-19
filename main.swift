@@ -175,7 +175,7 @@ class DiskScanManager: ObservableObject {
             } else {
                 // Use osascript with administrator privileges to prompt macOS password dialog for USB drives
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                let script = "do shell script \"\(self.smartctlPath) --all --json \(devicePath)\" with administrator privileges"
+                let script = "do shell script \"\(self.smartctlPath) --all --json \(devicePath) || true\" with administrator privileges"
                 process.arguments = ["-e", script]
             }
             
