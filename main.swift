@@ -60,14 +60,14 @@ struct ATASmartAttributes: Decodable {
 struct ATAAttribute: Decodable, Identifiable {
     let id: Int
     let name: String
-    let value: Int
-    let worst: Int
-    let threshold: Int
-    let raw: ATARawValue
+    let value: Int?
+    let worst: Int?
+    let threshold: Int?
+    let raw: ATARawValue?
     
     struct ATARawValue: Decodable {
-        let value: Int
-        let string: String
+        let value: Int?
+        let string: String?
     }
 }
 
@@ -619,22 +619,22 @@ struct RealMetricsTab: View {
                     .width(min: 150, max: 220)
                     
                     TableColumn("Value") { attr in
-                        Text("\(attr.value)")
+                        Text(attr.value != nil ? "\(attr.value!)" : "-")
                     }
                     .width(min: 40, max: 60)
                     
                     TableColumn("Worst") { attr in
-                        Text("\(attr.worst)")
+                        Text(attr.worst != nil ? "\(attr.worst!)" : "-")
                     }
                     .width(min: 40, max: 60)
                     
                     TableColumn("Threshold") { attr in
-                        Text("\(attr.threshold)")
+                        Text(attr.threshold != nil ? "\(attr.threshold!)" : "-")
                     }
                     .width(min: 40, max: 60)
                     
                     TableColumn("Raw Value") { attr in
-                        Text(attr.raw.string)
+                        Text(attr.raw?.string ?? "-")
                             .foregroundColor(.secondary)
                     }
                 }
