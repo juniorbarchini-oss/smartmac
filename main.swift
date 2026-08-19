@@ -114,7 +114,7 @@ struct NVMESmartHealthLog: Decodable {
 // MARK: - Models for Storage and Remote Connections
 struct StorageDevice: Identifiable, Hashable, Codable {
     let id: UUID
-    let path: String // e.g. /dev/disk0 or /dev/sda
+    let path: String
     let name: String
     let size: String
     let isRemote: Bool
@@ -128,14 +128,15 @@ struct RemoteHost: Identifiable, Hashable, Codable {
     let ip: String
     let port: String
     let username: String
-    var selectedDisks: [String] // Disk paths e.g. ["/dev/sda", "/dev/sdb"]
+    let password: String
+    var selectedDisks: [String]
 }
 
 // MARK: - Local SMART Executor & Host Manager
 class DiskScanManager: ObservableObject {
     @Published var isScanning = false
     @Published var scanError: String?
-    @Published var activeScanResult: SmartctlOutput?
+    @Published var scanResults: [String: SmartctlOutput] = [:]
     @Published var detectedDisks: [StorageDevice] = []
     @Published var remoteHosts: [RemoteHost] = []
     
@@ -214,7 +215,7 @@ class DiskScanManager: ObservableObject {
     // MARK: - Remote SSH Hosts Persistance
     func loadRemoteHosts() {
         let defaults = UserDefaults.standard
-        if let data = defaults.data(forKey: "remote_hosts_data") {
+        if let data = defaults.data(forKey: "remote_hosts_data_v2") {
             if let decoded = try? JSONDecoder().decode([RemoteHost].self, from: data) {
                 self.remoteHosts = decoded
             }
@@ -223,7 +224,7 @@ class DiskScanManager: ObservableObject {
     
     func saveRemoteHosts() {
         if let encoded = try? JSONEncoder().encode(remoteHosts) {
-            UserDefaults.standard.set(encoded, forKey: "remote_hosts_data")
+            UserDefaults.standard.set(encoded, forKey: "remote_hosts_data_v2")
         }
     }
     
@@ -238,58 +239,191 @@ class DiskScanManager: ObservableObject {
         saveRemoteHosts()
     }
     
-    // MARK: - Scan Executor (Local & SSH Simulation)
+    // MARK: - Real SSH Commands Executor using Expect
+    func runSSHSmartctlScan(host: RemoteHost, devicePath: String) async -> Result<SmartctlOutput, Error> {
+        let task = Task.detached(priority: .userInitiated) { () -> Result<SmartctlOutput, Error> in
+            let process = Process()
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
+            
+            // Script to handle SSH login and sudo password prompt if requested
+            let port = host.port.isEmpty ? "22" : host.port
+            let expectScript = """
+            set timeout 15
+            spawn ssh -o StrictHostKeyChecking=no -p \(port) \(host.username)@\(host.ip) "sudo -S smartctl --all --json \(devicePath) || smartctl --all --json \(devicePath) || true"
+            expect {
+                "password:" {
+                    send "\(host.password)\\r"
+                    exp_continue
+                }
+                "password for" {
+                    send "\(host.password)\\r"
+                    exp_continue
+                }
+                "Permission denied" {
+                    exit 1
+                }
+                timeout {
+                    exit 2
+                }
+                eof
+            }
+            """
+            
+            process.arguments = ["-c", expectScript]
+            process.standardOutput = pipe
+            process.standardError = errPipe
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                
+                if process.terminationStatus != 0 {
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errStr = String(data: errData, encoding: .utf8) ?? "Authentication or SSH timeout error."
+                    return .failure(NSError(domain: "SmartMacApp", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errStr]))
+                }
+                
+                // Parse stdout to find the JSON start
+                if let rawOutput = String(data: data, encoding: .utf8) {
+                    print("--- Raw SSH Scan Output ---\n", rawOutput)
+                    if let jsonStart = rawOutput.firstIndex(of: "{") {
+                        let jsonStr = String(rawOutput[jsonStart...])
+                        if let jsonData = jsonStr.data(using: .utf8) {
+                            let decoder = JSONDecoder()
+                            let decoded = try decoder.decode(SmartctlOutput.self, from: jsonData)
+                            return .success(decoded)
+                        }
+                    }
+                }
+                
+                return .failure(NSError(domain: "SmartMacApp", code: 3, userInfo: [NSLocalizedDescriptionKey: "Did not receive structured JSON data from remote smartctl."]))
+            } catch {
+                return .failure(error)
+            }
+        }
+        return await task.value
+    }
+    
+    func discoverRemoteDisksReal(ip: String, port: String, user: String, pass: String) async -> Result<[String], Error> {
+        let task = Task.detached(priority: .userInitiated) { () -> Result<[String], Error> in
+            let process = Process()
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
+            
+            let portArg = port.isEmpty ? "22" : port
+            // Try to find disks using smartctl --scan, and fallback to parsing lsblk if it is a Linux host without smartctl privileges
+            let expectScript = """
+            set timeout 15
+            spawn ssh -o StrictHostKeyChecking=no -p \(portArg) \(user)@\(ip) "sudo -S smartctl --scan --json || smartctl --scan --json || lsblk -d -o NAME -n || true"
+            expect {
+                "password:" {
+                    send "\(pass)\\r"
+                    exp_continue
+                }
+                "password for" {
+                    send "\(pass)\\r"
+                    exp_continue
+                }
+                "Permission denied" {
+                    exit 1
+                }
+                timeout {
+                    exit 2
+                }
+                eof
+            }
+            """
+            
+            process.arguments = ["-c", expectScript]
+            process.standardOutput = pipe
+            process.standardError = errPipe
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                
+                if process.terminationStatus != 0 {
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errStr = String(data: errData, encoding: .utf8) ?? "Authentication or SSH connection failed."
+                    return .failure(NSError(domain: "SmartMacApp", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errStr]))
+                }
+                
+                // Parse results
+                if let rawOutput = String(data: data, encoding: .utf8) {
+                    print("--- Raw SSH Discover Output ---\n", rawOutput)
+                    
+                    // Option A: Try to find JSON from smartctl --scan --json
+                    if let jsonStart = rawOutput.firstIndex(of: "{") {
+                        let jsonStr = String(rawOutput[jsonStart...])
+                        struct ScanResponse: Decodable {
+                            struct Device: Decodable {
+                                let name: String
+                            }
+                            let devices: [Device]?
+                        }
+                        if let jsonData = jsonStr.data(using: .utf8),
+                           let decoded = try? JSONDecoder().decode(ScanResponse.self, from: jsonData),
+                           let devs = decoded.devices {
+                            return .success(devs.map { $0.name })
+                        }
+                    }
+                    
+                    // Option B: Fallback, parse standard text lines (e.g. lsblk /dev/sda, sdb)
+                    let lines = rawOutput.components(separatedBy: .newlines)
+                    var paths: [String] = []
+                    for line in lines {
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if trimmed.hasPrefix("/dev/disk") || trimmed.hasPrefix("/dev/sd") || trimmed.hasPrefix("/dev/nvme") {
+                            if let firstSpace = trimmed.firstIndex(of: " ") {
+                                paths.append(String(trimmed[..<firstSpace]))
+                            } else {
+                                paths.append(trimmed)
+                            }
+                        } else if trimmed.hasPrefix("sd") || trimmed.hasPrefix("nvme") {
+                            // Convert basic lsblk name to full device node path
+                            paths.append("/dev/\(trimmed)")
+                        }
+                    }
+                    if !paths.isEmpty {
+                        return .success(Array(Set(paths)).sorted())
+                    }
+                }
+                
+                return .failure(NSError(domain: "SmartMacApp", code: 3, userInfo: [NSLocalizedDescriptionKey: "No physical disks discovered on remote server. Ensure smartctl or lsblk is installed."]))
+            } catch {
+                return .failure(error)
+            }
+        }
+        return await task.value
+    }
+    
+    // MARK: - Scan Executor
     @MainActor
     func runScan(on device: StorageDevice) async {
         isScanning = true
         scanError = nil
-        activeScanResult = nil
         
-        if device.isRemote {
-            // Simulated SSH Scan
-            // In the production version, this will open a Citadel SSH channel and run:
-            // "sudo smartctl --all --json [device.path]"
-            try? await Task.sleep(nanoseconds: 1_500_000_000) // Simulating network latency
+        let deviceKey = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+        
+        if device.isRemote, let hostId = device.hostId, let host = remoteHosts.first(where: { $0.id == hostId }) {
+            // Real SSH Scan
+            let result = await runSSHSmartctlScan(host: host, devicePath: device.path)
             isScanning = false
             
-            // Build mock smartctl JSON response representing a healthy Linux RAID / Enterprise SSD
-            let mockJSON = """
-            {
-              "model_name": "Intel D3-S4510 3.84TB",
-              "serial_number": "PHDV824901AZ3P8GN",
-              "firmware_version": "XCV10120",
-              "device": {
-                "name": "\(device.path)",
-                "protocol": "SATA"
-              },
-              "smart_status": {
-                "passed": true
-              },
-              "temperature": {
-                "current": 37
-              },
-              "power_cycle_count": 42,
-              "power_on_time": {
-                "hours": 14520
-              },
-              "ata_smart_attributes": {
-                "table": [
-                  { "id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "threshold": 10, "raw": { "value": 0, "string": "0" } },
-                  { "id": 9, "name": "Power_On_Hours", "value": 90, "worst": 90, "threshold": 0, "raw": { "value": 14520, "string": "14520" } },
-                  { "id": 12, "name": "Power_Cycle_Count", "value": 100, "worst": 100, "threshold": 0, "raw": { "value": 42, "string": "42" } },
-                  { "id": 194, "name": "Temperature_Celsius", "value": 63, "worst": 50, "threshold": 0, "raw": { "value": 37, "string": "37 (Min/Max 18/51)" } }
-                ]
-              }
-            }
-            """
-            
-            if let data = mockJSON.data(using: .utf8) {
-                do {
-                    let decoded = try JSONDecoder().decode(SmartctlOutput.self, from: data)
-                    self.activeScanResult = decoded
-                } catch {
-                    self.scanError = "Failed to parse remote data: \(error.localizedDescription)"
-                }
+            switch result {
+            case .success(let output):
+                self.scanResults[deviceKey] = output
+            case .failure(let error):
+                self.scanError = "SSH Scan Failed: \(error.localizedDescription)"
             }
             return
         }
@@ -345,7 +479,7 @@ class DiskScanManager: ObservableObject {
         
         switch result {
         case .success(let output):
-            self.activeScanResult = output
+            self.scanResults[deviceKey] = output
         case .failure(let error):
             self.scanError = error.localizedDescription
         }
@@ -465,6 +599,14 @@ struct DiskDetailView: View {
     @ObservedObject var scanManager: DiskScanManager
     @State private var selectedTab = "overview"
     
+    private var deviceKey: String {
+        return "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+    }
+    
+    private var scanResult: SmartctlOutput? {
+        return scanManager.scanResults[deviceKey]
+    }
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Disk Header
@@ -475,11 +617,11 @@ struct DiskDetailView: View {
                 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
-                        Text(scanManager.activeScanResult?.modelName ?? device.name)
+                        Text(scanResult?.modelName ?? device.name)
                             .font(.largeTitle)
                             .fontWeight(.bold)
                         
-                        if let passed = scanManager.activeScanResult?.smartStatus?.passed {
+                        if let passed = scanResult?.smartStatus?.passed {
                             Text(passed ? "HEALTHY" : "FAILING")
                                 .font(.caption)
                                 .fontWeight(.bold)
@@ -490,7 +632,7 @@ struct DiskDetailView: View {
                                 .cornerRadius(5)
                         }
                     }
-                    Text("Protocol: \(scanManager.activeScanResult?.device?.protocolName ?? "Unknown") | Serial: \(scanManager.activeScanResult?.serialNumber ?? "N/A")")
+                    Text("Protocol: \(scanResult?.device?.protocolName ?? "Unknown") | Serial: \(scanResult?.serialNumber ?? "N/A")")
                         .font(.body)
                         .foregroundColor(.secondary)
                 }
@@ -555,7 +697,7 @@ struct DiskDetailView: View {
             
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    if let result = scanManager.activeScanResult {
+                    if let result = scanResult {
                         if selectedTab == "overview" {
                             RealOverviewTab(result: result)
                         } else {
@@ -592,6 +734,7 @@ struct RealOverviewTab: View {
                 .fontWeight(.bold)
             
             Grid(alignment: .leading, horizontalSpacing: 25, verticalSpacing: 15) {
+                // 1. Common Temperature
                 if let temp = result.temperature?.current {
                     GridRow {
                         Text("Temperature:")
@@ -605,6 +748,7 @@ struct RealOverviewTab: View {
                     }
                 }
                 
+                // 2. Remaining Life / SMART Health Status
                 if let log = result.nvmeSmartHealthInformationLog {
                     let healthPct = 100 - log.percentageUsed
                     GridRow {
@@ -632,6 +776,7 @@ struct RealOverviewTab: View {
                     }
                 }
                 
+                // 3. Common Power Cycles
                 if let cycles = result.powerCycleCount {
                     GridRow {
                         Text("Power Cycles:")
@@ -640,6 +785,7 @@ struct RealOverviewTab: View {
                     }
                 }
                 
+                // 4. Common Power On Hours
                 if let hours = result.powerOnTime?.hours {
                     GridRow {
                         Text("Power On Hours:")
@@ -648,6 +794,7 @@ struct RealOverviewTab: View {
                     }
                 }
                 
+                // 5. NVMe Data Units (specific)
                 if let log = result.nvmeSmartHealthInformationLog {
                     GridRow {
                         Text("Data Units Written:")
@@ -665,19 +812,21 @@ struct RealOverviewTab: View {
                     }
                 }
                 
+                // 6. Protocol Name
                 GridRow {
                     Text("Connection Protocol:")
                         .fontWeight(.semibold)
                     Text(result.device?.protocolName ?? "Unknown")
                 }
                 
+                // Fallback explanation if no common metrics are found at all
                 if result.temperature?.current == nil && result.smartStatus == nil {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("✓ Password accepted. Raw connection established.")
                             .font(.caption)
                             .foregroundColor(.green)
                             .fontWeight(.semibold)
-                        Text("However, this specific USB enclosure's bridge chip does not translate S.M.A.R.T. commands under macOS.")
+                        Text("However, this specific USB enclosure's bridge chip does not translate S.M.A.T. commands under macOS.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Text("To read telemetry from this drive, connect it via a Thunderbolt port/enclosure, or use a Linux/Windows host.")
@@ -825,7 +974,6 @@ struct SettingsView: View {
                 // TAB 2: Network Hosts Management
                 VStack(alignment: .leading, spacing: 10) {
                     if showingAddHost {
-                        // MARK: - Add Host Form & Disk Discovery
                         ScrollView {
                             VStack(alignment: .leading, spacing: 12) {
                                 Text("Add Remote Server (SSH)").font(.headline)
@@ -843,6 +991,7 @@ struct SettingsView: View {
                                     Text(err)
                                         .font(.caption)
                                         .foregroundColor(.red)
+                                        .textSelection(.enabled)
                                 }
                                 
                                 HStack {
@@ -853,7 +1002,9 @@ struct SettingsView: View {
                                             .foregroundColor(.secondary)
                                     } else {
                                         Button("Connect & Discover Disks") {
-                                            discoverRemoteDisks()
+                                            Task {
+                                                await discoverRemoteDisks()
+                                            }
                                         }
                                         .buttonStyle(.bordered)
                                         .disabled(hostIp.isEmpty || hostUser.isEmpty || hostPassword.isEmpty)
@@ -910,7 +1061,6 @@ struct SettingsView: View {
                         }
                         .padding(.top, 10)
                     } else {
-                        // MARK: - Hosts List View
                         HStack {
                             Text("Configured Servers").font(.headline)
                             Spacer()
@@ -969,24 +1119,27 @@ struct SettingsView: View {
         .frame(width: 500, height: 480)
     }
     
-    // MARK: - Simulation of Disk Discovery over SSH
-    private func discoverRemoteDisks() {
+    // MARK: - Real SSH Disk Discovery over network
+    private func discoverRemoteDisks() async {
         isDiscovering = true
         discoveryError = nil
         discoveredDisks = []
         
-        // Simulating the SSH shell command execution:
-        // "ssh user@host 'sudo smartctl --scan --json'"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
-            self.isDiscovering = false
-            // Simulation result based on standard Linux setups (e.g. TrueNAS or Synology)
-            self.discoveredDisks = [
-                "/dev/sda", // Main SATA SSD
-                "/dev/sdb", // Storage Pool HDD 1
-                "/dev/sdc", // Storage Pool HDD 2
-                "/dev/nvme0n1" // Cache NVMe M.2
-            ]
-            self.selectedDisks = ["/dev/sda"] // Select the first one by default
+        let result = await scanManager.discoverRemoteDisksReal(
+            ip: hostIp,
+            port: hostPort,
+            user: hostUser,
+            pass: hostPassword
+        )
+        
+        isDiscovering = false
+        
+        switch result {
+        case .success(let paths):
+            self.discoveredDisks = paths
+            self.selectedDisks = Set(paths) // Select all by default
+        case .failure(let error):
+            self.discoveryError = error.localizedDescription
         }
     }
     
@@ -997,6 +1150,7 @@ struct SettingsView: View {
             ip: hostIp,
             port: hostPort,
             username: hostUser,
+            password: hostPassword,
             selectedDisks: Array(selectedDisks).sorted()
         )
         scanManager.addRemoteHost(newHost)
