@@ -337,12 +337,14 @@ class DiskScanManager: ObservableObject {
     @Published var scanResults: [String: SmartctlOutput] = [:]
     @Published var detectedDisks: [StorageDevice] = []
     @Published var remoteHosts: [RemoteHost] = []
+    @Published var allDevices: [StorageDevice] = []
     
     private let smartctlPath = "/opt/homebrew/bin/smartctl"
     
     init() {
         refreshDiskList()
         loadRemoteHosts()
+        updateAllDevices()
     }
     
     func refreshDiskList() {
@@ -389,6 +391,27 @@ class DiskScanManager: ObservableObject {
         } catch {
             self.detectedDisks = [StorageDevice(path: "/dev/disk0", name: "Macintosh SSD (/dev/disk0)", size: "Internal Health Check", isRemote: false, address: nil, hostId: nil)]
         }
+        updateAllDevices()
+    }
+    
+    func updateAllDevices() {
+        var devices = detectedDisks
+        
+        for host in remoteHosts {
+            for diskPath in host.selectedDisks {
+                let dev = StorageDevice(
+                    path: diskPath,
+                    name: "Disk \(diskPath.components(separatedBy: "/").last ?? diskPath)",
+                    size: "Remote SSH Node",
+                    isRemote: true,
+                    address: host.ip,
+                    hostId: host.id
+                )
+                devices.append(dev)
+            }
+        }
+        
+        self.allDevices = devices
     }
     
     func ejectDevice(devicePath: String) {
@@ -415,6 +438,7 @@ class DiskScanManager: ObservableObject {
         if let data = defaults.data(forKey: "remote_hosts_data_v2") {
             if let decoded = try? JSONDecoder().decode([RemoteHost].self, from: data) {
                 self.remoteHosts = decoded
+                updateAllDevices()
             }
         }
     }
@@ -429,11 +453,13 @@ class DiskScanManager: ObservableObject {
         remoteHosts.removeAll(where: { $0.ip == host.ip })
         remoteHosts.append(host)
         saveRemoteHosts()
+        updateAllDevices()
     }
     
     func removeRemoteHost(_ host: RemoteHost) {
         remoteHosts.removeAll(where: { $0.id == host.id })
         saveRemoteHosts()
+        updateAllDevices()
     }
     
     // MARK: - Real SSH Commands Executor using Expect
@@ -1028,8 +1054,6 @@ struct DiskDetailView: View {
                 }
                 .padding()
             }
-            
-            Spacer()
         }
     }
 }
