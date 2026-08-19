@@ -827,7 +827,7 @@ struct DiskDetailView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Disk Header
+            // Disk Header (Always fixed at the top)
             HStack(spacing: 15) {
                 Image(systemName: device.isRemote ? "server.rack" : (device.path == "/dev/disk0" ? "internaldrive" : "externaldrive"))
                     .font(.system(size: 40))
@@ -890,124 +890,18 @@ struct DiskDetailView: View {
             
             Divider()
             
-            // Rich Hardware & Health Diagnosis Panel (for average users)
-            if let result = scanResult {
-                VStack(alignment: .leading, spacing: 10) {
-                    // Hardware info grid
-                    HStack(spacing: 30) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("CAPACIDAD")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.secondary)
-                            Text(result.formattedCapacity)
-                                .font(.title3)
-                                .fontWeight(.bold)
-                        }
-                        
-                        Divider().frame(height: 35)
-                        
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("TIPO DE UNIDAD")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.secondary)
-                            Text(result.deviceTypeDescription)
-                                .font(.body)
-                                .fontWeight(.medium)
-                        }
-                        
-                        Divider().frame(height: 35)
-                        
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("NÚMERO DE SERIE")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.secondary)
-                            Text(result.serialNumber ?? "N/A")
-                                .font(.body)
-                                .foregroundColor(.secondary)
-                        }
-                        
-                        Divider().frame(height: 35)
-                        
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("FIRMWARE")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.secondary)
-                            Text(result.firmwareVersion ?? "N/A")
-                                .font(.body)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(8)
-                    .padding(.horizontal)
-                    .padding(.top)
-                    
-                    // Diagnosis Panel
-                    let diagnosis = result.runDiagnosis()
-                    HStack(alignment: .top, spacing: 15) {
-                        Image(systemName: diagnosis.iconName)
-                            .font(.system(size: 32))
-                            .foregroundColor(diagnosis.color)
-                        
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(diagnosis.title)
-                                .font(.title3)
-                                .fontWeight(.bold)
-                                .foregroundColor(diagnosis.color)
-                            
-                            Text(diagnosis.message)
-                                .font(.body)
-                                .foregroundColor(.primary)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .lineLimit(nil)
-                            
-                            if diagnosis.status != .healthy {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    if diagnosis.reallocatedSectors > 0 {
-                                        Text("• Sectores Reasignados: \(diagnosis.reallocatedSectors) (Sectores dañados físicamente aislados por el disco)")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    if diagnosis.pendingSectors > 0 {
-                                        Text("• Sectores Pendientes: \(diagnosis.pendingSectors) (Sectores inestables con fallas activas de lectura/escritura)")
-                                            .font(.caption)
-                                            .foregroundColor(.red)
-                                            .fontWeight(.semibold)
-                                    }
-                                    if diagnosis.criticalCount > 0 {
-                                        Text("• Sectores Incorregibles (Offline): \(diagnosis.criticalCount) (Daño físico permanente en la superficie)")
-                                            .font(.caption)
-                                            .foregroundColor(.red)
-                                            .fontWeight(.bold)
-                                    }
-                                    if diagnosis.crcErrors > 0 {
-                                        Text("• Errores de Interfaz (CRC): \(diagnosis.crcErrors) (Problemas con el cable SATA, conector o energía)")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-                                }
-                                .padding(.top, 4)
-                            }
-                        }
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(diagnosis.backgroundColor)
-                    .cornerRadius(10)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(diagnosis.strokeColor, lineWidth: 1)
-                    )
-                    .padding(.horizontal)
+            // Tab Selector (Fixed below the header)
+            if scanResult != nil {
+                Picker("", selection: $selectedTab) {
+                    Text("Overview").tag("overview")
+                    Text("Detailed Metrics").tag("metrics")
                 }
+                .pickerStyle(SegmentedPickerStyle())
+                .padding(.horizontal)
+                .padding(.vertical, 10)
             }
             
+            // Diagnostic Errors (Fixed block)
             if let error = scanManager.scanError {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Diagnostic Error", systemImage: "exclamationmark.triangle")
@@ -1022,25 +916,132 @@ struct DiskDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.red.opacity(0.1))
                 .cornerRadius(8)
-                .padding()
+                .padding(.horizontal)
+                .padding(.top, 5)
             }
             
-            Picker("", selection: $selectedTab) {
-                Text("Overview").tag("overview")
-                Text("Detailed Metrics").tag("metrics")
-            }
-            .pickerStyle(SegmentedPickerStyle())
-            .padding()
-            
+            // Scrollable Content (Adapts dynamically to window size)
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     if let result = scanResult {
+                        // 1. Rich Hardware Info Grid
+                        HStack(spacing: 30) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("CAPACIDAD")
+                                    .font(.caption2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.secondary)
+                                Text(result.formattedCapacity)
+                                    .font(.title3)
+                                    .fontWeight(.bold)
+                            }
+                            
+                            Divider().frame(height: 35)
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("TIPO DE UNIDAD")
+                                    .font(.caption2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.secondary)
+                                Text(result.deviceTypeDescription)
+                                    .font(.body)
+                                    .fontWeight(.medium)
+                            }
+                            
+                            Divider().frame(height: 35)
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("NÚMERO DE SERIE")
+                                    .font(.caption2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.secondary)
+                                Text(result.serialNumber ?? "N/A")
+                                    .font(.body)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            Divider().frame(height: 35)
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("FIRMWARE")
+                                    .font(.caption2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.secondary)
+                                Text(result.firmwareVersion ?? "N/A")
+                                    .font(.body)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(8)
+                        
+                        // 2. Heuristic Health Diagnosis Panel
+                        let diagnosis = result.runDiagnosis()
+                        HStack(alignment: .top, spacing: 15) {
+                            Image(systemName: diagnosis.iconName)
+                                .font(.system(size: 32))
+                                .foregroundColor(diagnosis.color)
+                            
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(diagnosis.title)
+                                    .font(.title3)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(diagnosis.color)
+                                
+                                Text(diagnosis.message)
+                                    .font(.body)
+                                    .foregroundColor(.primary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .lineLimit(nil)
+                                
+                                if diagnosis.status != .healthy {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        if diagnosis.reallocatedSectors > 0 {
+                                            Text("• Sectores Reasignados: \(diagnosis.reallocatedSectors) (Sectores dañados físicamente aislados por el disco)")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        if diagnosis.pendingSectors > 0 {
+                                            Text("• Sectores Pendientes: \(diagnosis.pendingSectors) (Sectores inestables con fallas activas de lectura/escritura)")
+                                                .font(.caption)
+                                                .foregroundColor(.red)
+                                                .fontWeight(.semibold)
+                                        }
+                                        if diagnosis.criticalCount > 0 {
+                                            Text("• Sectores Incorregibles (Offline): \(diagnosis.criticalCount) (Daño físico permanente en la superficie)")
+                                                .font(.caption)
+                                                .foregroundColor(.red)
+                                                .fontWeight(.bold)
+                                        }
+                                        if diagnosis.crcErrors > 0 {
+                                            Text("• Errores de Interfaz (CRC): \(diagnosis.crcErrors) (Problemas con el cable SATA, conector o energía)")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    .padding(.top, 4)
+                                }
+                            }
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(diagnosis.backgroundColor)
+                        .cornerRadius(10)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(diagnosis.strokeColor, lineWidth: 1)
+                        )
+                        
+                        // 3. Tab Specific Metrics
                         if selectedTab == "overview" {
                             RealOverviewTab(result: result)
                         } else {
                             RealMetricsTab(result: result)
                         }
                     } else {
+                        // Scan Prompt
                         VStack(spacing: 15) {
                             Image(systemName: "gauge.medium")
                                 .font(.system(size: 48))
@@ -1049,7 +1050,7 @@ struct DiskDetailView: View {
                                 .font(.body)
                                 .foregroundColor(.secondary)
                         }
-                        .frame(maxWidth: .infinity, minHeight: 200)
+                        .frame(maxWidth: .infinity, minHeight: 250)
                     }
                 }
                 .padding()
