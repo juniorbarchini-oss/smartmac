@@ -246,33 +246,37 @@ class DiskScanManager: ObservableObject {
             let pipe = Pipe()
             let errPipe = Pipe()
             
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
-            
-            // Script to handle SSH login and sudo password prompt if requested
-            let port = host.port.isEmpty ? "22" : host.port
-            let expectScript = """
-            set timeout 15
-            spawn ssh -o StrictHostKeyChecking=no -p \(port) \(host.username)@\(host.ip) "sudo -S smartctl --all --json \(devicePath) || smartctl --all --json \(devicePath) || true"
-            expect {
-                "password:" {
-                    send "\(host.password)\\r"
-                    exp_continue
+            // Redirect to python bridge if legacy NAS
+            if host.ip == "192.168.100.14" {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                process.arguments = ["/Users/hbarchini/Documents/desarrollo/smartmac-app/ssh_bridge.py", "scan", devicePath]
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
+                let port = host.port.isEmpty ? "22" : host.port
+                let expectScript = """
+                set timeout 15
+                spawn ssh -o StrictHostKeyChecking=no -p \(port) \(host.username)@\(host.ip) "sudo -S smartctl --all --json \(devicePath) || smartctl --all --json \(devicePath) || true"
+                expect {
+                    "password:" {
+                        send "\(host.password)\\r"
+                        exp_continue
+                    }
+                    "password for" {
+                        send "\(host.password)\\r"
+                        exp_continue
+                    }
+                    "Permission denied" {
+                        exit 1
+                    }
+                    timeout {
+                        exit 2
+                    }
+                    eof
                 }
-                "password for" {
-                    send "\(host.password)\\r"
-                    exp_continue
-                }
-                "Permission denied" {
-                    exit 1
-                }
-                timeout {
-                    exit 2
-                }
-                eof
+                """
+                process.arguments = ["-c", expectScript]
             }
-            """
             
-            process.arguments = ["-c", expectScript]
             process.standardOutput = pipe
             process.standardError = errPipe
             
@@ -288,9 +292,7 @@ class DiskScanManager: ObservableObject {
                     return .failure(NSError(domain: "SmartMacApp", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errStr]))
                 }
                 
-                // Parse stdout to find the JSON start
                 if let rawOutput = String(data: data, encoding: .utf8) {
-                    print("--- Raw SSH Scan Output ---\n", rawOutput)
                     if let jsonStart = rawOutput.firstIndex(of: "{") {
                         let jsonStr = String(rawOutput[jsonStart...])
                         if let jsonData = jsonStr.data(using: .utf8) {
@@ -315,33 +317,36 @@ class DiskScanManager: ObservableObject {
             let pipe = Pipe()
             let errPipe = Pipe()
             
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
-            
-            let portArg = port.isEmpty ? "22" : port
-            // Try to find disks using smartctl --scan, and fallback to parsing lsblk if it is a Linux host without smartctl privileges
-            let expectScript = """
-            set timeout 15
-            spawn ssh -o StrictHostKeyChecking=no -p \(portArg) \(user)@\(ip) "sudo -S smartctl --scan --json || smartctl --scan --json || lsblk -d -o NAME -n || true"
-            expect {
-                "password:" {
-                    send "\(pass)\\r"
-                    exp_continue
+            if ip == "192.168.100.14" {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                process.arguments = ["/Users/hbarchini/Documents/desarrollo/smartmac-app/ssh_bridge.py", "discover"]
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
+                let portArg = port.isEmpty ? "22" : port
+                let expectScript = """
+                set timeout 15
+                spawn ssh -o StrictHostKeyChecking=no -p \(portArg) \(user)@\(ip) "sudo -S smartctl --scan --json || smartctl --scan --json || lsblk -d -o NAME -n || true"
+                expect {
+                    "password:" {
+                        send "\(pass)\\r"
+                        exp_continue
+                    }
+                    "password for" {
+                        send "\(pass)\\r"
+                        exp_continue
+                    }
+                    "Permission denied" {
+                        exit 1
+                    }
+                    timeout {
+                        exit 2
+                    }
+                    eof
                 }
-                "password for" {
-                    send "\(pass)\\r"
-                    exp_continue
-                }
-                "Permission denied" {
-                    exit 1
-                }
-                timeout {
-                    exit 2
-                }
-                eof
+                """
+                process.arguments = ["-c", expectScript]
             }
-            """
             
-            process.arguments = ["-c", expectScript]
             process.standardOutput = pipe
             process.standardError = errPipe
             
@@ -357,11 +362,19 @@ class DiskScanManager: ObservableObject {
                     return .failure(NSError(domain: "SmartMacApp", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errStr]))
                 }
                 
-                // Parse results
                 if let rawOutput = String(data: data, encoding: .utf8) {
                     print("--- Raw SSH Discover Output ---\n", rawOutput)
                     
-                    // Option A: Try to find JSON from smartctl --scan --json
+                    if ip == "192.168.100.14" {
+                        if let jsonStart = rawOutput.firstIndex(of: "[") {
+                            let jsonStr = String(rawOutput[jsonStart...])
+                            if let jsonData = jsonStr.data(using: .utf8),
+                               let paths = try? JSONDecoder().decode([String].self, from: jsonData) {
+                                return .success(paths)
+                            }
+                        }
+                    }
+                    
                     if let jsonStart = rawOutput.firstIndex(of: "{") {
                         let jsonStr = String(rawOutput[jsonStart...])
                         struct ScanResponse: Decodable {
@@ -377,7 +390,6 @@ class DiskScanManager: ObservableObject {
                         }
                     }
                     
-                    // Option B: Fallback, parse standard text lines (e.g. lsblk /dev/sda, sdb)
                     let lines = rawOutput.components(separatedBy: .newlines)
                     var paths: [String] = []
                     for line in lines {
@@ -389,7 +401,6 @@ class DiskScanManager: ObservableObject {
                                 paths.append(trimmed)
                             }
                         } else if trimmed.hasPrefix("sd") || trimmed.hasPrefix("nvme") {
-                            // Convert basic lsblk name to full device node path
                             paths.append("/dev/\(trimmed)")
                         }
                     }
