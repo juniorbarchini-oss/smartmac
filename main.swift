@@ -249,7 +249,7 @@ class DiskScanManager: ObservableObject {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
             let port = host.port.isEmpty ? "22" : host.port
             let expectScript = """
-            set timeout 15
+            set timeout 45
             spawn ssh -o StrictHostKeyChecking=no -p \(port) \(host.username)@\(host.ip) "sudo -S smartctl --all --json \(devicePath) || smartctl --all --json \(devicePath) || true"
             expect {
                 "ssword" {
@@ -278,7 +278,17 @@ class DiskScanManager: ObservableObject {
                 
                 if process.terminationStatus != 0 {
                     let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                    let errStr = String(data: errData, encoding: .utf8) ?? "Authentication or SSH timeout error."
+                    var errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    
+                    if errStr.isEmpty {
+                        if process.terminationStatus == 2 {
+                            errStr = "Connection Timeout (45s expired): The remote disk is taking too long to respond. This usually indicates severe hardware blockages, bad physical sectors, or I/O retries on the SATA controller of the server."
+                        } else if process.terminationStatus == 1 {
+                            errStr = "SSH Permission Denied: Invalid credentials or insufficient sudo privileges on the remote host."
+                        } else {
+                            errStr = "SSH execution terminated with exit code \(process.terminationStatus)."
+                        }
+                    }
                     return .failure(NSError(domain: "SmartMacApp", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errStr]))
                 }
                 
