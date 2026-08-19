@@ -86,10 +86,10 @@ struct DiskDiagnosis {
     
     var title: String {
         switch status {
-        case .healthy: return "Estado del Disco: Saludable"
-        case .warning: return "Estado del Disco: Advertencia / Degradándose"
-        case .critical: return "Estado del Disco: Alerta Crítica"
-        case .failing: return "Estado del Disco: Alerta Crítica / Fallo Inminente"
+        case .healthy: return "Disk Status: Healthy"
+        case .warning: return "Disk Status: Warning / Degrading"
+        case .critical: return "Disk Status: Critical Alert"
+        case .failing: return "Disk Status: Critical Alert / Imminent Failure"
         }
     }
     
@@ -136,18 +136,32 @@ extension SmartctlOutput {
     }
     
     var formattedCapacity: String {
-        guard let bytes = userCapacity?.bytes else { return "Unknown Size" }
-        let tb = Double(bytes) / 1_000_000_000_000.0
-        if tb >= 0.9 {
-            return String(format: "%.2f TB", tb)
+        if let bytes = userCapacity?.bytes {
+            let tb = Double(bytes) / 1_000_000_000_000.0
+            if tb >= 0.9 {
+                return String(format: "%.2f TB", tb)
+            }
+            let gb = Double(bytes) / 1_000_000_000.0
+            return String(format: "%.0f GB", gb)
         }
-        let gb = Double(bytes) / 1_000_000_000.0
-        return String(format: "%.0f GB", gb)
+        
+        // Fallback for macOS local system disk (/dev/disk0)
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/"),
+           let space = attrs[.systemSize] as? Int64 {
+            let tb = Double(space) / 1_000_000_000_000.0
+            if tb >= 0.9 {
+                return String(format: "%.2f TB", tb)
+            }
+            let gb = Double(space) / 1_000_000_000.0
+            return String(format: "%.0f GB", gb)
+        }
+        
+        return "Unknown Size"
     }
     
     func runDiagnosis() -> DiskDiagnosis {
         var status = HealthStatus.healthy
-        var message = "El disco funciona dentro de los parámetros normales de hardware. No se detectan anomalías."
+        var message = "The disk is functioning within normal hardware parameters. No anomalies detected."
         var criticalCount = 0
         var reallocatedSectors = 0
         var pendingSectors = 0
@@ -157,19 +171,19 @@ extension SmartctlOutput {
         if let nvme = nvmeSmartHealthInformationLog {
             if nvme.mediaErrors > 0 {
                 status = .critical
-                message = "ALERTA CRÍTICA: Se detectaron \(nvme.mediaErrors) errores de integridad de datos y media física. Sus archivos están en riesgo de corrupción. ¡Haga una copia de seguridad inmediatamente!"
+                message = "CRITICAL ALERT: Detected \(nvme.mediaErrors) data integrity and physical media errors. Your files are at risk of corruption. Back up immediately!"
                 criticalCount += nvme.mediaErrors
             }
             if nvme.criticalWarning > 0 {
                 status = .failing
-                message = "FALLO INMINENTE: El controlador NVMe reporta alertas de hardware críticas (Código: \(nvme.criticalWarning)). La unidad está fallando o se encuentra en modo de protección de solo lectura."
+                message = "IMMINENT FAILURE: NVMe controller reports critical hardware warnings (Code: \(nvme.criticalWarning)). The drive is failing or in write-protection read-only mode."
                 criticalCount += 1
             }
             if nvme.percentageUsed >= 95 {
                 if status != .failing && status != .critical {
                     status = .warning
                 }
-                message = "Desgaste del Disco: La vida útil consumida es del \(nvme.percentageUsed)%. La unidad está llegando al final de su ciclo de vida operativo."
+                message = "Drive Wearout: Life used is \(nvme.percentageUsed)%. The drive is approaching the end of its operational lifespan."
             }
             
             return DiskDiagnosis(
@@ -201,23 +215,23 @@ extension SmartctlOutput {
             
             if pendingSectors > 0 || criticalCount > 0 {
                 status = .failing
-                message = "FALLO FÍSICO INMINENTE: El disco tiene \(pendingSectors) sectores pendientes de reasignar y \(criticalCount) sectores incorregibles. ¡Hay fallos de lectura/escritura activos en la superficie física del disco! Respaldar y reemplazar de inmediato."
+                message = "IMMINENT PHYSICAL FAILURE: The disk has \(pendingSectors) pending sectors to reallocate and \(criticalCount) uncorrectable sectors. There are active read/write failures on the physical disk surface! Back up and replace immediately."
             } else if reallocatedSectors > 0 {
                 if reallocatedSectors > 50 {
                     status = .critical
-                    message = "ALERTA CRÍTICA: El disco ha reasignado \(reallocatedSectors) sectores dañados. La degradación física es alta y los sectores defectuosos siguen propagándose. Se recomienda reemplazo urgente."
+                    message = "CRITICAL ALERT: The disk has reallocated \(reallocatedSectors) bad sectors. Physical degradation is high and bad sectors continue to spread. Urgent replacement recommended."
                 } else {
                     status = .warning
-                    message = "ADVERTENCIA: El disco tiene \(reallocatedSectors) sectores defectuosos reasignados. El hardware ha comenzado a degradarse físicamente, pero ha logrado aislar los sectores dañados por ahora. Vigilar de cerca."
+                    message = "WARNING: The disk has \(reallocatedSectors) reallocated bad sectors. The hardware has started physically degrading, but has successfully isolated the damaged sectors for now. Monitor closely."
                 }
             } else if crcErrors > 50 {
                 status = .warning
-                message = "Alerta de Interfaz: Se detectaron \(crcErrors) errores de checksum (CRC) en la transferencia de datos. Esto indica que el cable de datos SATA está dañado, el conector está flojo o la alimentación es inestable."
+                message = "Interface Alert: Detected \(crcErrors) checksum (CRC) errors in data transfer. This indicates the SATA data cable might be damaged, the connector is loose, or power is unstable."
             }
             
             if let passed = smartStatus?.passed, !passed {
                 status = .failing
-                message = "AUTO-DIAGNÓSTICO DEL FIRMWARE (SMART): ¡FALLO INMINENTE DETECTADO! El propio firmware del disco ha declarado que la unidad va a fallar. Guarde su información y apague el equipo."
+                message = "FIRMWARE SELF-TEST (SMART): IMMINENT FAILURE DETECTED! The drive's own firmware has declared that the unit is about to fail. Back up your data and power off the machine."
             }
         }
         
@@ -927,7 +941,7 @@ struct DiskDetailView: View {
                         // 1. Rich Hardware Info Grid
                         HStack(spacing: 30) {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("CAPACIDAD")
+                                Text("CAPACITY")
                                     .font(.caption2)
                                     .fontWeight(.semibold)
                                     .foregroundColor(.secondary)
@@ -939,7 +953,7 @@ struct DiskDetailView: View {
                             Divider().frame(height: 35)
                             
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("TIPO DE UNIDAD")
+                                Text("DRIVE TYPE")
                                     .font(.caption2)
                                     .fontWeight(.semibold)
                                     .foregroundColor(.secondary)
@@ -951,7 +965,7 @@ struct DiskDetailView: View {
                             Divider().frame(height: 35)
                             
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("NÚMERO DE SERIE")
+                                Text("SERIAL NUMBER")
                                     .font(.caption2)
                                     .fontWeight(.semibold)
                                     .foregroundColor(.secondary)
@@ -999,24 +1013,24 @@ struct DiskDetailView: View {
                                 if diagnosis.status != .healthy {
                                     VStack(alignment: .leading, spacing: 4) {
                                         if diagnosis.reallocatedSectors > 0 {
-                                            Text("• Sectores Reasignados: \(diagnosis.reallocatedSectors) (Sectores dañados físicamente aislados por el disco)")
+                                            Text("• Reallocated Sectors: \(diagnosis.reallocatedSectors) (Bad physical sectors isolated by the disk)")
                                                 .font(.caption)
                                                 .foregroundColor(.secondary)
                                         }
                                         if diagnosis.pendingSectors > 0 {
-                                            Text("• Sectores Pendientes: \(diagnosis.pendingSectors) (Sectores inestables con fallas activas de lectura/escritura)")
+                                            Text("• Pending Sectors: \(diagnosis.pendingSectors) (Unstable sectors with active read/write failures)")
                                                 .font(.caption)
                                                 .foregroundColor(.red)
                                                 .fontWeight(.semibold)
                                         }
                                         if diagnosis.criticalCount > 0 {
-                                            Text("• Sectores Incorregibles (Offline): \(diagnosis.criticalCount) (Daño físico permanente en la superficie)")
+                                            Text("• Uncorrectable Sectors (Offline): \(diagnosis.criticalCount) (Permanent physical damage on the surface)")
                                                 .font(.caption)
                                                 .foregroundColor(.red)
                                                 .fontWeight(.bold)
                                         }
                                         if diagnosis.crcErrors > 0 {
-                                            Text("• Errores de Interfaz (CRC): \(diagnosis.crcErrors) (Problemas con el cable SATA, conector o energía)")
+                                            Text("• Interface Errors (CRC): \(diagnosis.crcErrors) (Problems with the SATA cable, connector, or power)")
                                                 .font(.caption)
                                                 .foregroundColor(.secondary)
                                         }
