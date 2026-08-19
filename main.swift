@@ -26,6 +26,10 @@ struct SmartctlOutput: Decodable {
     let smartStatus: SmartStatus?
     let nvmeSmartHealthInformationLog: NVMESmartHealthLog?
     let device: DeviceInfo?
+    let temperature: TemperatureInfo?
+    let powerCycleCount: Int?
+    let powerOnTime: PowerOnTimeInfo?
+    let ataSmartAttributes: ATASmartAttributes?
     
     enum CodingKeys: String, CodingKey {
         case modelName = "model_name"
@@ -34,6 +38,36 @@ struct SmartctlOutput: Decodable {
         case smartStatus = "smart_status"
         case nvmeSmartHealthInformationLog = "nvme_smart_health_information_log"
         case device
+        case temperature
+        case powerCycleCount = "power_cycle_count"
+        case powerOnTime = "power_on_time"
+        case ataSmartAttributes = "ata_smart_attributes"
+    }
+}
+
+struct TemperatureInfo: Decodable {
+    let current: Int
+}
+
+struct PowerOnTimeInfo: Decodable {
+    let hours: Int?
+}
+
+struct ATASmartAttributes: Decodable {
+    let table: [ATAAttribute]
+}
+
+struct ATAAttribute: Decodable, Identifiable {
+    let id: Int
+    let name: String
+    let value: Int
+    let worst: Int
+    let threshold: Int
+    let raw: ATARawValue
+    
+    struct ATARawValue: Decodable {
+        let value: Int
+        let string: String
     }
 }
 
@@ -441,22 +475,26 @@ struct RealOverviewTab: View {
                 .fontWeight(.bold)
             
             Grid(alignment: .leading, horizontalSpacing: 25, verticalSpacing: 15) {
-                if let log = result.nvmeSmartHealthInformationLog {
+                // 1. Common Temperature
+                if let temp = result.temperature?.current {
                     GridRow {
                         Text("Temperature:")
                             .fontWeight(.semibold)
                         HStack {
-                            Text("\(log.temperature) °C")
-                                .foregroundColor(log.temperature > 50 ? .red : (log.temperature > 40 ? .orange : .primary))
+                            Text("\(temp) °C")
+                                .foregroundColor(temp > 50 ? .red : (temp > 40 ? .orange : .primary))
                             Image(systemName: "thermometer.medium")
-                                .foregroundColor(log.temperature > 45 ? .red : .blue)
+                                .foregroundColor(temp > 45 ? .red : .blue)
                         }
                     }
-                    
+                }
+                
+                // 2. Remaining Life / SMART Health Status
+                if let log = result.nvmeSmartHealthInformationLog {
+                    let healthPct = 100 - log.percentageUsed
                     GridRow {
                         Text("Remaining Life (Health):")
                             .fontWeight(.semibold)
-                        let healthPct = 100 - log.percentageUsed
                         VStack(alignment: .leading, spacing: 5) {
                             ProgressView(value: Double(healthPct), total: 100)
                                 .tint(healthPct < 20 ? .red : (healthPct < 50 ? .orange : .green))
@@ -464,36 +502,6 @@ struct RealOverviewTab: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                    }
-                    
-                    GridRow {
-                        Text("Power Cycles:")
-                            .fontWeight(.semibold)
-                        Text("\(log.powerCycles)")
-                    }
-                    
-                    GridRow {
-                        Text("Power On Hours:")
-                            .fontWeight(.semibold)
-                        Text("\(log.powerOnHours) hours (~ \(log.powerOnHours / 24) days)")
-                    }
-                    
-                    GridRow {
-                        Text("Data Units Written:")
-                            .fontWeight(.semibold)
-                        // smartctl reports data units written in 512 byte blocks * 1000.
-                        // bytes = dataUnitsWritten * 1000 * 512
-                        let bytesWritten = Double(log.dataUnitsWritten) * 1000 * 512
-                        let tbWritten = bytesWritten / (1024 * 1024 * 1024 * 1024)
-                        Text(String(format: "%.2f TB Written", tbWritten))
-                    }
-                    
-                    GridRow {
-                        Text("Data Units Read:")
-                            .fontWeight(.semibold)
-                        let bytesRead = Double(log.dataUnitsRead) * 1000 * 512
-                        let tbRead = bytesRead / (1024 * 1024 * 1024 * 1024)
-                        Text(String(format: "%.2f TB Read", tbRead))
                     }
                 } else if let status = result.smartStatus {
                     GridRow {
@@ -507,51 +515,59 @@ struct RealOverviewTab: View {
                                 .foregroundColor(status.passed ? .green : .red)
                         }
                     }
-                    
+                }
+                
+                // 3. Common Power Cycles
+                if let cycles = result.powerCycleCount {
                     GridRow {
-                        Text("Connection Interface:")
+                        Text("Power Cycles:")
                             .fontWeight(.semibold)
-                        Text(result.device?.protocolName ?? "USB Bridge")
+                        Text("\(cycles)")
                     }
-                    
+                }
+                
+                // 4. Common Power On Hours
+                if let hours = result.powerOnTime?.hours {
                     GridRow {
-                        Text("Detailed Telemetry:")
+                        Text("Power On Hours:")
                             .fontWeight(.semibold)
-                        Text("Limited (USB Bridge)")
-                            .foregroundColor(.orange)
+                        Text("\(hours) hours (~ \(hours / 24) days)")
                     }
-                    
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("Detailed health parameters (like temperature or writes) are blocked by the macOS USB driver for this enclosure bridge chipset.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Text("However, the drive controller's internal self-check reports the device as HEALTHY.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .italic()
-                    }
-                    .padding(.top, 5)
-                } else {
+                }
+                
+                // 5. NVMe Data Units (specific)
+                if let log = result.nvmeSmartHealthInformationLog {
                     GridRow {
-                        Text("SMART Status:")
+                        Text("Data Units Written:")
                             .fontWeight(.semibold)
-                        Text("Telemetry Blocked")
-                            .foregroundColor(.orange)
+                        let bytesWritten = Double(log.dataUnitsWritten) * 1000 * 512
+                        let tbWritten = bytesWritten / (1024 * 1024 * 1024 * 1024)
+                        Text(String(format: "%.2f TB Written", tbWritten))
                     }
-                    
                     GridRow {
-                        Text("USB Connection:")
+                        Text("Data Units Read:")
                             .fontWeight(.semibold)
-                        Text("Unauthorized / Restricted Bridge")
-                            .foregroundColor(.orange)
+                        let bytesRead = Double(log.dataUnitsRead) * 1000 * 512
+                        let tbRead = bytesRead / (1024 * 1024 * 1024 * 1024)
+                        Text(String(format: "%.2f TB Read", tbRead))
                     }
-                    
+                }
+                
+                // 6. Protocol Name
+                GridRow {
+                    Text("Connection Protocol:")
+                        .fontWeight(.semibold)
+                    Text(result.device?.protocolName ?? "Unknown")
+                }
+                
+                // Fallback explanation if no common metrics are found at all
+                if result.temperature?.current == nil && result.smartStatus == nil {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("✓ Password accepted. Raw connection established.")
                             .font(.caption)
                             .foregroundColor(.green)
                             .fontWeight(.semibold)
-                        Text("However, this specific USB enclosure's bridge chip does not translate NVMe S.M.A.R.T. commands under macOS.")
+                        Text("However, this specific USB enclosure's bridge chip does not translate S.M.A.R.T. commands under macOS.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Text("To read telemetry from this drive, connect it via a Thunderbolt port/enclosure, or use a Linux/Windows host.")
@@ -588,8 +604,43 @@ struct RealMetricsTab: View {
                 }
                 .frame(height: 250)
                 .cornerRadius(10)
+            } else if let ata = result.ataSmartAttributes {
+                // Show SATA/ATA attributes in a neat table
+                Table(ata.table) {
+                    TableColumn("ID") { attr in
+                        Text("\(attr.id)")
+                    }
+                    .width(min: 30, max: 40)
+                    
+                    TableColumn("Attribute Name") { attr in
+                        Text(attr.name)
+                            .fontWeight(.medium)
+                    }
+                    .width(min: 150, max: 220)
+                    
+                    TableColumn("Value") { attr in
+                        Text("\(attr.value)")
+                    }
+                    .width(min: 40, max: 60)
+                    
+                    TableColumn("Worst") { attr in
+                        Text("\(attr.worst)")
+                    }
+                    .width(min: 40, max: 60)
+                    
+                    TableColumn("Threshold") { attr in
+                        Text("\(attr.threshold)")
+                    }
+                    .width(min: 40, max: 60)
+                    
+                    TableColumn("Raw Value") { attr in
+                        Text(attr.raw.string)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(height: 300)
             } else {
-                Text("No NVMe specific health log entries parsed for this device format.")
+                Text("No S.M.A.R.T. health log entries parsed for this device format.")
                     .foregroundColor(.secondary)
             }
         }
