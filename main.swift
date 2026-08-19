@@ -145,6 +145,20 @@ class DiskScanManager: ObservableObject {
         }
     }
     
+    func ejectDevice(devicePath: String) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        task.arguments = ["eject", devicePath]
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            refreshDiskList()
+        } catch {
+            print("Failed to eject device: \(error)")
+        }
+    }
+    
     func checkSmartctlAvailability() -> Bool {
         return FileManager.default.fileExists(atPath: smartctlPath)
     }
@@ -335,15 +349,28 @@ struct DiskDetailView: View {
                     ProgressView()
                         .padding(.trailing, 10)
                 } else {
-                    Button(action: {
-                        Task {
-                            await scanManager.runScan(on: device.path)
+                    HStack(spacing: 10) {
+                        if device.path != "/dev/disk0" {
+                            Button(action: {
+                                scanManager.ejectDevice(devicePath: device.path)
+                            }) {
+                                Label("Eject", systemImage: "eject")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                            .help("Eject external disk safely")
                         }
-                    }) {
-                        Label("Scan Now", systemImage: "play.fill")
+                        
+                        Button(action: {
+                            Task {
+                                await scanManager.runScan(on: device.path)
+                            }
+                        }) {
+                            Label("Scan Now", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
                 }
             }
             .padding()
