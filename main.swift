@@ -18,35 +18,166 @@ enum AppTheme: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - Disk Info Model (Mock Data)
+// MARK: - Smartctl Output Model
+struct SmartctlOutput: Decodable {
+    let modelName: String?
+    let serialNumber: String?
+    let firmwareVersion: String?
+    let smartStatus: SmartStatus?
+    let nvmeSmartHealthInformationLog: NVMESmartHealthLog?
+    let device: DeviceInfo?
+    
+    enum CodingKeys: String, CodingKey {
+        case modelName = "model_name"
+        case serialNumber = "serial_number"
+        case firmwareVersion = "firmware_version"
+        case smartStatus = "smart_status"
+        case nvmeSmartHealthInformationLog = "nvme_smart_health_information_log"
+        case device
+    }
+}
+
+struct DeviceInfo: Decodable {
+    let name: String
+    let protocolName: String?
+    
+    enum CodingKeys: String, CodingKey {
+        case name
+        case protocolName = "protocol"
+    }
+}
+
+struct SmartStatus: Decodable {
+    let passed: Bool
+}
+
+struct NVMESmartHealthLog: Decodable {
+    let criticalWarning: Int
+    let temperature: Int
+    let availableSpare: Int
+    let percentageUsed: Int
+    let dataUnitsRead: Int
+    let dataUnitsWritten: Int
+    let powerCycles: Int
+    let powerOnHours: Int
+    let unsafeShutdowns: Int
+    let mediaErrors: Int
+    
+    enum CodingKeys: String, CodingKey {
+        case criticalWarning = "critical_warning"
+        case temperature
+        case availableSpare = "available_spare"
+        case percentageUsed = "percentage_used"
+        case dataUnitsRead = "data_units_read"
+        case dataUnitsWritten = "data_units_written"
+        case powerCycles = "power_cycles"
+        case powerOnHours = "power_on_hours"
+        case unsafeShutdowns = "unsafe_shutdowns"
+        case mediaErrors = "media_errors"
+    }
+}
+
+// MARK: - Disk Info Model (Representable on UI)
 struct StorageDevice: Identifiable, Hashable {
     let id = UUID()
+    let path: String // e.g. /dev/disk0
     let name: String
-    let type: DeviceType
     let size: String
-    let health: HealthStatus
-    let temperature: Int
-    let percentRemaining: Int?
     let isRemote: Bool
     let address: String?
+}
+
+// MARK: - Local SMART Executor
+class DiskScanManager: ObservableObject {
+    @Published var isScanning = false
+    @Published var scanError: String?
+    @Published var activeScanResult: SmartctlOutput?
+    @Published var detectedDisks: [StorageDevice] = []
     
-    enum DeviceType {
-        case internalNVMe
-        case externalUSB
-        case networkShare
+    private let smartctlPath = "/opt/homebrew/bin/smartctl"
+    
+    init() {
+        refreshDiskList()
     }
     
-    enum HealthStatus: String {
-        case healthy = "Healthy"
-        case warning = "Warning"
-        case critical = "Critical"
-        
-        var color: Color {
-            switch self {
-            case .healthy: return .green
-            case .warning: return .orange
-            case .critical: return .red
+    func refreshDiskList() {
+        let fileManager = FileManager.default
+        do {
+            let devContents = try fileManager.contentsOfDirectory(atPath: "/dev")
+            let diskRegex = try NSRegularExpression(pattern: "^disk\\d+$")
+            let physicalDisks = devContents.filter { item in
+                let range = NSRange(location: 0, length: item.utf16.count)
+                return diskRegex.firstMatch(in: item, options: [], range: range) != nil
+            }.map { "/dev/\($0)" }.sorted()
+            
+            self.detectedDisks = physicalDisks.map { path in
+                let isMain = path == "/dev/disk0"
+                return StorageDevice(
+                    path: path,
+                    name: isMain ? "Macintosh SSD (\(path))" : "External USB Drive (\(path))",
+                    size: isMain ? "Internal Health Check" : "External Health Check",
+                    isRemote: false,
+                    address: nil
+                )
             }
+        } catch {
+            self.detectedDisks = [StorageDevice(path: "/dev/disk0", name: "Macintosh SSD (/dev/disk0)", size: "Internal Health Check", isRemote: false, address: nil)]
+        }
+    }
+    
+    func checkSmartctlAvailability() -> Bool {
+        return FileManager.default.fileExists(atPath: smartctlPath)
+    }
+    
+    @MainActor
+    func runScan(on devicePath: String) async {
+        isScanning = true
+        scanError = nil
+        activeScanResult = nil
+        
+        guard checkSmartctlAvailability() else {
+            isScanning = false
+            scanError = "smartctl binary not found. Please install it using Homebrew:\nbrew install smartmontools"
+            return
+        }
+        
+        let task = Task.detached(priority: .userInitiated) { () -> Result<SmartctlOutput, Error> in
+            let process = Process()
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            
+            process.executableURL = URL(fileURLWithPath: self.smartctlPath)
+            process.arguments = ["--all", "--json", devicePath]
+            process.standardOutput = pipe
+            process.standardError = errPipe
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                
+                // Print raw output to console for debug
+                if let rawJSON = String(data: data, encoding: .utf8) {
+                    print("--- Raw smartctl response ---\n", rawJSON)
+                }
+                
+                let decoder = JSONDecoder()
+                let decoded = try decoder.decode(SmartctlOutput.self, from: data)
+                return .success(decoded)
+            } catch {
+                return .failure(error)
+            }
+        }
+        
+        let result = await task.value
+        isScanning = false
+        
+        switch result {
+        case .success(let output):
+            self.activeScanResult = output
+        case .failure(let error):
+            self.scanError = "Failed to parse SMART data: \(error.localizedDescription)"
         }
     }
 }
@@ -54,56 +185,46 @@ struct StorageDevice: Identifiable, Hashable {
 // MARK: - Main Content View
 struct ContentView: View {
     @AppStorage("selectedTheme") private var selectedTheme: AppTheme = .system
+    @StateObject private var scanManager = DiskScanManager()
     @State private var selectedDevice: StorageDevice?
     @State private var showSettings = false
-    
-    let devices = [
-        StorageDevice(name: "Macintosh HD", type: .internalNVMe, size: "1 TB NVMe SSD", health: .healthy, temperature: 32, percentRemaining: 98, isRemote: false, address: nil),
-        StorageDevice(name: "T7 Shield", type: .externalUSB, size: "2 TB USB-C SSD", health: .healthy, temperature: 28, percentRemaining: 94, isRemote: false, address: nil),
-        StorageDevice(name: "Synology NAS", type: .networkShare, size: "16 TB RAID 5 HDD", health: .warning, temperature: 41, percentRemaining: nil, isRemote: true, address: "192.168.1.100"),
-        StorageDevice(name: "i7 HomeLab", type: .networkShare, size: "512 GB SATA SSD", health: .healthy, temperature: 35, percentRemaining: 88, isRemote: true, address: "192.168.1.200")
-    ]
     
     var body: some View {
         NavigationSplitView {
             List(selection: $selectedDevice) {
                 Section("Local Storage") {
-                    ForEach(devices.filter { !$0.isRemote }, id: \.self) { device in
+                    ForEach(scanManager.detectedDisks, id: \.self) { device in
                         NavigationLink(value: device) {
                             Label {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(device.name)
                                         .font(.headline)
-                                    Text(device.size)
+                                    Text(device.path)
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
                             } icon: {
-                                Image(systemName: device.type == .internalNVMe ? "internaldrive" : "externaldrive")
+                                Image(systemName: device.path == "/dev/disk0" ? "internaldrive" : "externaldrive")
                                     .imageScale(.large)
-                                    .foregroundColor(device.health.color)
+                                    .foregroundColor(device.path == "/dev/disk0" ? .blue : .purple)
                             }
                         }
                     }
                 }
                 
-                Section("Network Hosts (SSH)") {
-                    ForEach(devices.filter { $0.isRemote }, id: \.self) { device in
-                        NavigationLink(value: device) {
-                            Label {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(device.name)
-                                        .font(.headline)
-                                    Text(device.address ?? "")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                            } icon: {
-                                Image(systemName: "server.rack")
-                                    .imageScale(.large)
-                                    .foregroundColor(device.health.color)
-                            }
+                Section("Network Hosts (SSH Mock)") {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Synology NAS")
+                                .font(.headline)
+                            Text("192.168.1.100")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
+                    } icon: {
+                        Image(systemName: "server.rack")
+                            .imageScale(.large)
+                            .foregroundColor(.gray)
                     }
                 }
             }
@@ -121,17 +242,19 @@ struct ContentView: View {
                     
                     Spacer()
                     
-                    Button(action: { }) {
-                        Label("Scan All", systemImage: "arrow.clockwise")
+                    Button(action: {
+                        scanManager.refreshDiskList()
+                    }) {
+                        Label("Refresh", systemImage: "arrow.clockwise")
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
                     .controlSize(.small)
                     .padding()
                 }
             }
         } detail: {
             if let device = selectedDevice {
-                DiskDetailView(device: device)
+                DiskDetailView(device: device, scanManager: scanManager)
             } else {
                 VStack(spacing: 15) {
                     Image(systemName: "opticaldisk")
@@ -153,70 +276,102 @@ struct ContentView: View {
 // MARK: - Disk Detail View Component
 struct DiskDetailView: View {
     let device: StorageDevice
+    @ObservedObject var scanManager: DiskScanManager
     @State private var selectedTab = "overview"
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // Disk Header
             HStack(spacing: 15) {
-                Image(systemName: device.type == .internalNVMe ? "internaldrive" : (device.type == .externalUSB ? "externaldrive" : "server.rack"))
+                Image(systemName: device.path == "/dev/disk0" ? "internaldrive" : "externaldrive")
                     .font(.system(size: 40))
-                    .foregroundColor(device.health.color)
+                    .foregroundColor(.blue)
                 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
-                        Text(device.name)
+                        Text(scanManager.activeScanResult?.modelName ?? device.name)
                             .font(.largeTitle)
                             .fontWeight(.bold)
                         
-                        Text(device.health.rawValue.uppercased())
-                            .font(.caption)
-                            .fontWeight(.bold)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(device.health.color.opacity(0.2))
-                            .foregroundColor(device.health.color)
-                            .cornerRadius(5)
+                        if let passed = scanManager.activeScanResult?.smartStatus?.passed {
+                            Text(passed ? "HEALTHY" : "FAILING")
+                                .font(.caption)
+                                .fontWeight(.bold)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(passed ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
+                                .foregroundColor(passed ? .green : .red)
+                                .cornerRadius(5)
+                        }
                     }
-                    Text(device.size)
+                    Text("Protocol: \(scanManager.activeScanResult?.device?.protocolName ?? "Unknown") | Serial: \(scanManager.activeScanResult?.serialNumber ?? "N/A")")
                         .font(.body)
                         .foregroundColor(.secondary)
                 }
                 Spacer()
                 
-                Button(action: { }) {
-                    Label("Scan Disk", systemImage: "play.fill")
+                if scanManager.isScanning {
+                    ProgressView()
+                        .padding(.trailing, 10)
+                } else {
+                    Button(action: {
+                        Task {
+                            await scanManager.runScan(on: device.path)
+                        }
+                    }) {
+                        Label("Scan Now", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                
-                Button(action: { }) {
-                    Image(systemName: "doc.badge.plus")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-                .help("Export diagnostic report")
             }
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
             
             Divider()
             
+            if let error = scanManager.scanError {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Diagnostic Error", systemImage: "exclamationmark.triangle")
+                        .font(.headline)
+                        .foregroundColor(.red)
+                    Text(error)
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.red.opacity(0.1))
+                .cornerRadius(8)
+                .padding()
+            }
+            
             Picker("", selection: $selectedTab) {
                 Text("Overview").tag("overview")
-                Text("SMART Attributes").tag("smart")
-                Text("Performance & Speed").tag("speed")
+                Text("Detailed Metrics").tag("metrics")
             }
             .pickerStyle(SegmentedPickerStyle())
             .padding()
             
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    if selectedTab == "overview" {
-                        OverviewTab(device: device)
-                    } else if selectedTab == "smart" {
-                        SMARTAttributesTab()
+                    if let result = scanManager.activeScanResult {
+                        if selectedTab == "overview" {
+                            RealOverviewTab(result: result)
+                        } else {
+                            RealMetricsTab(result: result)
+                        }
                     } else {
-                        PerformanceTab()
+                        VStack(spacing: 15) {
+                            Image(systemName: "gauge.medium")
+                                .font(.system(size: 48))
+                                .foregroundColor(.secondary)
+                            Text("Press 'Scan Now' to retrieve real S.M.A.R.T. health data.")
+                                .font(.body)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 200)
                     }
                 }
                 .padding()
@@ -227,136 +382,139 @@ struct DiskDetailView: View {
     }
 }
 
-// MARK: - Overview Tab Sub-view
-struct OverviewTab: View {
-    let device: StorageDevice
+// MARK: - Real Overview Tab (Displays Decoded JSON values)
+struct RealOverviewTab: View {
+    let result: SmartctlOutput
     
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 15) {
-            GridRow {
-                Text("Device Temperature:")
-                    .fontWeight(.semibold)
-                HStack {
-                    Text("\(device.temperature) °C")
-                        .foregroundColor(device.temperature > 40 ? .orange : .primary)
-                    Image(systemName: "thermometer.medium")
-                        .foregroundColor(device.temperature > 40 ? .orange : .blue)
-                }
-            }
+        VStack(alignment: .leading, spacing: 15) {
+            Text("General Health Check")
+                .font(.title2)
+                .fontWeight(.bold)
             
-            if let life = device.percentRemaining {
-                GridRow {
-                    Text("Remaining Life Indicator:")
-                        .fontWeight(.semibold)
-                    VStack(alignment: .leading, spacing: 5) {
-                        ProgressView(value: Double(life), total: 100)
-                            .tint(life < 20 ? .red : (life < 50 ? .orange : .green))
-                        Text("\(life)% (Great health)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+            Grid(alignment: .leading, horizontalSpacing: 25, verticalSpacing: 15) {
+                if let log = result.nvmeSmartHealthInformationLog {
+                    GridRow {
+                        Text("Temperature:")
+                            .fontWeight(.semibold)
+                        HStack {
+                            Text("\(log.temperature) °C")
+                                .foregroundColor(log.temperature > 50 ? .red : (log.temperature > 40 ? .orange : .primary))
+                            Image(systemName: "thermometer.medium")
+                                .foregroundColor(log.temperature > 45 ? .red : .blue)
+                        }
                     }
+                    
+                    GridRow {
+                        Text("Remaining Life (Health):")
+                            .fontWeight(.semibold)
+                        let healthPct = 100 - log.percentageUsed
+                        VStack(alignment: .leading, spacing: 5) {
+                            ProgressView(value: Double(healthPct), total: 100)
+                                .tint(healthPct < 20 ? .red : (healthPct < 50 ? .orange : .green))
+                            Text("\(healthPct)% Remaining")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    GridRow {
+                        Text("Power Cycles:")
+                            .fontWeight(.semibold)
+                        Text("\(log.powerCycles)")
+                    }
+                    
+                    GridRow {
+                        Text("Power On Hours:")
+                            .fontWeight(.semibold)
+                        Text("\(log.powerOnHours) hours (~ \(log.powerOnHours / 24) days)")
+                    }
+                    
+                    GridRow {
+                        Text("Data Units Written:")
+                            .fontWeight(.semibold)
+                        // smartctl reports data units written in 512 byte blocks * 1000.
+                        // bytes = dataUnitsWritten * 1000 * 512
+                        let bytesWritten = Double(log.dataUnitsWritten) * 1000 * 512
+                        let tbWritten = bytesWritten / (1024 * 1024 * 1024 * 1024)
+                        Text(String(format: "%.2f TB Written", tbWritten))
+                    }
+                    
+                    GridRow {
+                        Text("Data Units Read:")
+                            .fontWeight(.semibold)
+                        let bytesRead = Double(log.dataUnitsRead) * 1000 * 512
+                        let tbRead = bytesRead / (1024 * 1024 * 1024 * 1024)
+                        Text(String(format: "%.2f TB Read", tbRead))
+                    }
+                } else {
+                    GridRow {
+                        Text("SMART Status:")
+                            .fontWeight(.semibold)
+                        Text(result.smartStatus?.passed == true ? "PASSED" : "FAILED")
+                            .foregroundColor(result.smartStatus?.passed == true ? .green : .red)
+                    }
+                    Text("This drive protocol does not support NVMe standardized metrics. Check detailed logs for custom vendor attributes.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(10)
+        }
+    }
+}
+
+// MARK: - Real Metrics Tab
+struct RealMetricsTab: View {
+    let result: SmartctlOutput
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Hardware S.M.A.R.T. Log Values")
+                .font(.title2)
+                .fontWeight(.bold)
             
-            GridRow {
-                Text("Interface Protocol:")
-                    .fontWeight(.semibold)
-                Text(device.isRemote ? "SSH / Network" : (device.type == .internalNVMe ? "Apple Fabric NVMe" : "USB 3.2 (SAT Mode)"))
-            }
-            
-            GridRow {
-                Text("Last Diagnostic Run:")
-                    .fontWeight(.semibold)
-                Text("Today at 22:56 (On-Demand)")
+            if let log = result.nvmeSmartHealthInformationLog {
+                List {
+                    MetricRow(name: "Critical Warnings", value: "\(log.criticalWarning)", status: log.criticalWarning == 0 ? "Normal" : "WARNING", isWarning: log.criticalWarning > 0)
+                    MetricRow(name: "Available Spare Space", value: "\(log.availableSpare)%", status: log.availableSpare > 10 ? "OK" : "CRITICAL", isWarning: log.availableSpare <= 10)
+                    MetricRow(name: "Unsafe Shutdowns", value: "\(log.unsafeShutdowns)", status: "Informational", isWarning: false)
+                    MetricRow(name: "Media and Data Integrity Errors", value: "\(log.mediaErrors)", status: log.mediaErrors == 0 ? "Normal" : "CRITICAL", isWarning: log.mediaErrors > 0)
+                }
+                .frame(height: 250)
+                .cornerRadius(10)
+            } else {
+                Text("No NVMe specific health log entries parsed for this device format.")
                     .foregroundColor(.secondary)
             }
         }
-        .padding()
-        .background(Color(NSColor.controlBackgroundColor))
-        .cornerRadius(10)
     }
 }
 
-// MARK: - SMART Attributes Tab Sub-view
-struct SMARTAttributesTab: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Detailed S.M.A.R.T. Status Indicators")
-                .font(.headline)
-            
-            Table(of: SMARTAttribute.self) {
-                TableColumn("ID", value: \.idString)
-                    .width(min: 30, max: 50)
-                TableColumn("Attribute Name", value: \.name)
-                    .width(min: 150, max: 250)
-                TableColumn("Raw Value", value: \.rawValue)
-                TableColumn("Threshold", value: \.threshold)
-                TableColumn("Status", value: \.status)
-            } rows: {
-                TableRow(SMARTAttribute(id: 1, name: "Raw Read Error Rate", rawValue: "0", threshold: "51", status: "OK"))
-                TableRow(SMARTAttribute(id: 5, name: "Reallocated Sectors Count", rawValue: "0", threshold: "10", status: "OK"))
-                TableRow(SMARTAttribute(id: 9, name: "Power-On Hours", rawValue: "1,248 hrs", threshold: "0", status: "OK"))
-                TableRow(SMARTAttribute(id: 12, name: "Power Cycle Count", rawValue: "189", threshold: "0", status: "OK"))
-                TableRow(SMARTAttribute(id: 194, name: "Temperature", rawValue: "32°C", threshold: "0", status: "OK"))
-            }
-            .frame(height: 250)
-        }
-    }
-}
-
-struct SMARTAttribute: Identifiable {
-    let id: Int
+struct MetricRow: View {
     let name: String
-    let rawValue: String
-    let threshold: String
+    let value: String
     let status: String
+    let isWarning: Bool
     
-    var idString: String { String(id) }
-}
-
-// MARK: - Performance Tab Sub-view
-struct PerformanceTab: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 15) {
-            Text("On-Demand Speed Test")
-                .font(.headline)
-            
-            HStack(spacing: 20) {
-                VStack {
-                    Text("READ")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text("1,850 MB/s")
-                        .font(.title)
-                        .fontWeight(.bold)
-                        .foregroundColor(.blue)
-                }
-                .padding()
-                .frame(maxWidth: .infinity)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(10)
-                
-                VStack {
-                    Text("WRITE")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text("1,420 MB/s")
-                        .font(.title)
-                        .fontWeight(.bold)
-                        .foregroundColor(.purple)
-                }
-                .padding()
-                .frame(maxWidth: .infinity)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(10)
-            }
-            
-            Button(action: { }) {
-                Label("Start Speed Benchmark", systemImage: "gauge.medium")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
+        HStack {
+            Text(name)
+                .fontWeight(.medium)
+            Spacer()
+            Text(value)
+                .foregroundColor(.secondary)
+            Text(status)
+                .fontWeight(.semibold)
+                .foregroundColor(isWarning ? .red : .green)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(isWarning ? Color.red.opacity(0.1) : Color.green.opacity(0.1))
+                .cornerRadius(4)
         }
+        .padding(.vertical, 2)
     }
 }
 
@@ -364,9 +522,6 @@ struct PerformanceTab: View {
 struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
     @Binding var selectedTheme: AppTheme
-    
-    @State private var remoteHosts = ["Synology NAS (192.168.1.100)", "i7 HomeLab (192.168.1.200)"]
-    @State private var newHost = ""
     
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -382,35 +537,6 @@ struct SettingsView: View {
                 }
                 .pickerStyle(RadioGroupPickerStyle())
                 .padding(.vertical, 5)
-                
-                Divider()
-                
-                Section(header: Text("Remote SSH Connections").font(.headline)) {
-                    List {
-                        ForEach(remoteHosts, id: \.self) { host in
-                            HStack {
-                                Text(host)
-                                Spacer()
-                                Button(action: { remoteHosts.removeAll(where: { $0 == host }) }) {
-                                    Image(systemName: "trash")
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                    .frame(height: 100)
-                    
-                    HStack {
-                        TextField("e.g. user@192.168.1.50", text: $newHost)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                        Button("Add SSH Host") {
-                            if !newHost.isEmpty {
-                                remoteHosts.append(newHost)
-                                newHost = ""
-                            }
-                        }
-                    }
-                }
             }
             
             Spacer()
@@ -425,7 +551,7 @@ struct SettingsView: View {
             }
         }
         .padding()
-        .frame(width: 450, height: 450)
+        .frame(width: 400, height: 250)
     }
 }
 
@@ -435,7 +561,7 @@ struct SmartMacApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .frame(minWidth: 800, minHeight: 550)
+                .frame(minWidth: 850, minHeight: 600)
         }
         .windowStyle(HiddenTitleBarWindowStyle())
     }
