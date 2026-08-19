@@ -65,6 +65,15 @@ struct ATAAttribute: Decodable, Identifiable {
     let threshold: Int?
     let raw: ATARawValue?
     
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case value
+        case worst
+        case threshold = "thresh"
+        case raw
+    }
+    
     struct ATARawValue: Decodable {
         let value: Int?
         let string: String?
@@ -250,7 +259,7 @@ class DiskScanManager: ObservableObject {
             let port = host.port.isEmpty ? "22" : host.port
             let expectScript = """
             set timeout 45
-            spawn ssh -o StrictHostKeyChecking=no -p \(port) \(host.username)@\(host.ip) "sudo -S smartctl --all --json \(devicePath) || smartctl --all --json \(devicePath) || true"
+            spawn ssh -o StrictHostKeyChecking=no -p \(port) \(host.username)@\(host.ip) "sudo -S smartctl --all --json \(devicePath)"
             expect {
                 "ssword" {
                     send "\(host.password)\\r"
@@ -275,9 +284,24 @@ class DiskScanManager: ObservableObject {
                 process.waitUntilExit()
                 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 
+                // Intentamos decodificar el JSON de stdout primero. Si es exitoso, devolvemos success.
+                // Esto es crucial porque smartctl sale con códigos distintos de 0 si detecta advertencias de salud en el disco.
+                if let rawOutput = String(data: data, encoding: .utf8) {
+                    if let jsonStart = rawOutput.firstIndex(of: "{") {
+                        let jsonStr = String(rawOutput[jsonStart...])
+                        if let jsonData = jsonStr.data(using: .utf8) {
+                            let decoder = JSONDecoder()
+                            if let decoded = try? decoder.decode(SmartctlOutput.self, from: jsonData) {
+                                return .success(decoded)
+                            }
+                        }
+                    }
+                }
+                
+                // Si la decodificación del JSON falló, validamos el estado de terminación del proceso
                 if process.terminationStatus != 0 {
-                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                     var errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     
                     if errStr.isEmpty {
@@ -290,17 +314,6 @@ class DiskScanManager: ObservableObject {
                         }
                     }
                     return .failure(NSError(domain: "SmartMacApp", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errStr]))
-                }
-                
-                if let rawOutput = String(data: data, encoding: .utf8) {
-                    if let jsonStart = rawOutput.firstIndex(of: "{") {
-                        let jsonStr = String(rawOutput[jsonStart...])
-                        if let jsonData = jsonStr.data(using: .utf8) {
-                            let decoder = JSONDecoder()
-                            let decoded = try decoder.decode(SmartctlOutput.self, from: jsonData)
-                            return .success(decoded)
-                        }
-                    }
                 }
                 
                 return .failure(NSError(domain: "SmartMacApp", code: 3, userInfo: [NSLocalizedDescriptionKey: "Did not receive structured JSON data from remote smartctl."]))
