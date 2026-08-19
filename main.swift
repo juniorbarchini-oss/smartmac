@@ -214,7 +214,7 @@ class DiskScanManager: ObservableObject {
         case .success(let output):
             self.activeScanResult = output
         case .failure(let error):
-            self.scanError = error.localizedDescription
+            self.scanError = "Execution Error:\n\(error.localizedDescription)\n\nRaw: \(String(describing: error))"
         }
     }
 }
