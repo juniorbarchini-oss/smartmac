@@ -231,22 +231,6 @@ struct ContentView: View {
                         }
                     }
                 }
-                
-                Section("Network Hosts (SSH Mock)") {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Synology NAS")
-                                .font(.headline)
-                            Text("192.168.1.100")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "server.rack")
-                            .imageScale(.large)
-                            .foregroundColor(.gray)
-                    }
-                }
             }
             .listStyle(SidebarListStyle())
             .navigationTitle("SmartMac")
