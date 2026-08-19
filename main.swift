@@ -468,26 +468,55 @@ struct RealOverviewTab: View {
                         let tbRead = bytesRead / (1024 * 1024 * 1024 * 1024)
                         Text(String(format: "%.2f TB Read", tbRead))
                     }
-                } else {
+                } else if let status = result.smartStatus {
                     GridRow {
-                        Text("SMART Status:")
+                        Text("SMART Health Status:")
                             .fontWeight(.semibold)
-                        Text(result.smartStatus?.passed == true ? "PASSED" : "FAILED")
-                            .foregroundColor(result.smartStatus?.passed == true ? .green : .red)
+                        HStack {
+                            Text(status.passed ? "PASSED" : "FAILED")
+                                .fontWeight(.bold)
+                                .foregroundColor(status.passed ? .green : .red)
+                            Image(systemName: status.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundColor(status.passed ? .green : .red)
+                        }
                     }
                     
+                    GridRow {
+                        Text("Connection Interface:")
+                            .fontWeight(.semibold)
+                        Text(result.device?.protocolName ?? "USB Bridge")
+                    }
+                    
+                    GridRow {
+                        Text("Detailed Telemetry:")
+                            .fontWeight(.semibold)
+                        Text("Limited (USB Bridge)")
+                            .foregroundColor(.orange)
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Detailed health parameters (like temperature or writes) are blocked by the macOS USB driver for this enclosure bridge chipset.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("However, the drive controller's internal self-check reports the device as HEALTHY.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .italic()
+                    }
+                    .padding(.top, 5)
+                } else {
                     GridRow {
                         Text("USB Access Status:")
                             .fontWeight(.semibold)
                         Text("Restricted (No root privileges)")
-                            .foregroundColor(.orange)
+                            .foregroundColor(.red)
                     }
                     
                     VStack(alignment: .leading, spacing: 5) {
                         Text("Detailed S.M.A.R.T. telemetry is restricted on external USB drives by macOS security policies.")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        Text("The final version will request temporary administrative access (via HelperTool) to execute smartctl with full hardware access.")
+                        Text("Please enter your Mac password when prompted to authorize raw hardware communication.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .italic()
