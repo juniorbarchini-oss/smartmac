@@ -197,7 +197,7 @@ class DiskScanManager: ObservableObject {
         case .success(let output):
             self.activeScanResult = output
         case .failure(let error):
-            self.scanError = "Failed to parse SMART data: \(error.localizedDescription)"
+            self.scanError = "Detailed Error: \(String(describing: error))"
         }
     }
 }
