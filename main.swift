@@ -458,9 +458,24 @@ struct RealOverviewTab: View {
                         Text(result.smartStatus?.passed == true ? "PASSED" : "FAILED")
                             .foregroundColor(result.smartStatus?.passed == true ? .green : .red)
                     }
-                    Text("This drive protocol does not support NVMe standardized metrics. Check detailed logs for custom vendor attributes.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    
+                    GridRow {
+                        Text("USB Access Status:")
+                            .fontWeight(.semibold)
+                        Text("Restricted (No root privileges)")
+                            .foregroundColor(.orange)
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Detailed S.M.A.R.T. telemetry is restricted on external USB drives by macOS security policies.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("The final version will request temporary administrative access (via HelperTool) to execute smartctl with full hardware access.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .italic()
+                    }
+                    .padding(.top, 5)
                 }
             }
             .padding()
