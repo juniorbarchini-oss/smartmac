@@ -30,6 +30,8 @@ struct SmartctlOutput: Decodable {
     let powerCycleCount: Int?
     let powerOnTime: PowerOnTimeInfo?
     let ataSmartAttributes: ATASmartAttributes?
+    let userCapacity: UserCapacityInfo?
+    let rotationRate: Int?
     
     enum CodingKeys: String, CodingKey {
         case modelName = "model_name"
@@ -42,6 +44,191 @@ struct SmartctlOutput: Decodable {
         case powerCycleCount = "power_cycle_count"
         case powerOnTime = "power_on_time"
         case ataSmartAttributes = "ata_smart_attributes"
+        case userCapacity = "user_capacity"
+        case rotationRate = "rotation_rate"
+    }
+}
+
+struct UserCapacityInfo: Decodable {
+    let bytes: Int64?
+}
+
+enum HealthStatus: String {
+    case healthy = "Healthy"
+    case warning = "Warning"
+    case critical = "Critical"
+    case failing = "Failing"
+}
+
+struct DiskDiagnosis {
+    let status: HealthStatus
+    let message: String
+    let criticalCount: Int
+    let reallocatedSectors: Int
+    let pendingSectors: Int
+    let crcErrors: Int
+    
+    var iconName: String {
+        switch status {
+        case .healthy: return "checkmark.shield.fill"
+        case .warning: return "exclamationmark.shield.fill"
+        case .critical, .failing: return "xmark.shield.fill"
+        }
+    }
+    
+    var color: Color {
+        switch status {
+        case .healthy: return .green
+        case .warning: return .orange
+        case .critical, .failing: return .red
+        }
+    }
+    
+    var title: String {
+        switch status {
+        case .healthy: return "Estado del Disco: Saludable"
+        case .warning: return "Estado del Disco: Advertencia / Degradándose"
+        case .critical: return "Estado del Disco: Alerta Crítica"
+        case .failing: return "Estado del Disco: Alerta Crítica / Fallo Inminente"
+        }
+    }
+    
+    var backgroundColor: Color {
+        switch status {
+        case .healthy: return Color.green.opacity(0.1)
+        case .warning: return Color.orange.opacity(0.1)
+        case .critical, .failing: return Color.red.opacity(0.1)
+        }
+    }
+    
+    var strokeColor: Color {
+        switch status {
+        case .healthy: return Color.green.opacity(0.3)
+        case .warning: return Color.orange.opacity(0.3)
+        case .critical, .failing: return Color.red.opacity(0.3)
+        }
+    }
+}
+
+extension SmartctlOutput {
+    var deviceTypeDescription: String {
+        let proto = device?.protocolName?.uppercased() ?? ""
+        let model = modelName?.uppercased() ?? ""
+        
+        if proto == "NVME" {
+            return "Solid State Drive (NVMe M.2)"
+        }
+        
+        let isSSD = model.contains("SSD") || model.contains("SOLID STATE") || proto.contains("SSD")
+        
+        if let rate = rotationRate {
+            if rate == 0 {
+                return isSSD ? "Solid State Drive (SATA SSD)" : "Solid State Drive (SSD)"
+            } else if rate > 0 {
+                return "Mechanical Hard Drive (HDD, \(rate) RPM)"
+            }
+        }
+        
+        if isSSD {
+            return "Solid State Drive (SATA SSD)"
+        }
+        return proto.isEmpty ? "Unknown Type" : "Drive (\(proto))"
+    }
+    
+    var formattedCapacity: String {
+        guard let bytes = userCapacity?.bytes else { return "Unknown Size" }
+        let tb = Double(bytes) / 1_000_000_000_000.0
+        if tb >= 0.9 {
+            return String(format: "%.2f TB", tb)
+        }
+        let gb = Double(bytes) / 1_000_000_000.0
+        return String(format: "%.0f GB", gb)
+    }
+    
+    func runDiagnosis() -> DiskDiagnosis {
+        var status = HealthStatus.healthy
+        var message = "El disco funciona dentro de los parámetros normales de hardware. No se detectan anomalías."
+        var criticalCount = 0
+        var reallocatedSectors = 0
+        var pendingSectors = 0
+        var crcErrors = 0
+        
+        // 1. Diagnosis for NVMe
+        if let nvme = nvmeSmartHealthInformationLog {
+            if nvme.mediaErrors > 0 {
+                status = .critical
+                message = "ALERTA CRÍTICA: Se detectaron \(nvme.mediaErrors) errores de integridad de datos y media física. Sus archivos están en riesgo de corrupción. ¡Haga una copia de seguridad inmediatamente!"
+                criticalCount += nvme.mediaErrors
+            }
+            if nvme.criticalWarning > 0 {
+                status = .failing
+                message = "FALLO INMINENTE: El controlador NVMe reporta alertas de hardware críticas (Código: \(nvme.criticalWarning)). La unidad está fallando o se encuentra en modo de protección de solo lectura."
+                criticalCount += 1
+            }
+            if nvme.percentageUsed >= 95 {
+                if status != .failing && status != .critical {
+                    status = .warning
+                }
+                message = "Desgaste del Disco: La vida útil consumida es del \(nvme.percentageUsed)%. La unidad está llegando al final de su ciclo de vida operativo."
+            }
+            
+            return DiskDiagnosis(
+                status: status,
+                message: message,
+                criticalCount: criticalCount,
+                reallocatedSectors: 0,
+                pendingSectors: nvme.mediaErrors,
+                crcErrors: 0
+            )
+        }
+        
+        // 2. Diagnosis for SATA/ATA
+        if let table = ataSmartAttributes?.table {
+            for attr in table {
+                switch attr.id {
+                case 5:
+                    reallocatedSectors = attr.raw?.value ?? 0
+                case 197:
+                    pendingSectors = attr.raw?.value ?? 0
+                case 198:
+                    criticalCount += attr.raw?.value ?? 0
+                case 199:
+                    crcErrors = attr.raw?.value ?? 0
+                default:
+                    break
+                }
+            }
+            
+            if pendingSectors > 0 || criticalCount > 0 {
+                status = .failing
+                message = "FALLO FÍSICO INMINENTE: El disco tiene \(pendingSectors) sectores pendientes de reasignar y \(criticalCount) sectores incorregibles. ¡Hay fallos de lectura/escritura activos en la superficie física del disco! Respaldar y reemplazar de inmediato."
+            } else if reallocatedSectors > 0 {
+                if reallocatedSectors > 50 {
+                    status = .critical
+                    message = "ALERTA CRÍTICA: El disco ha reasignado \(reallocatedSectors) sectores dañados. La degradación física es alta y los sectores defectuosos siguen propagándose. Se recomienda reemplazo urgente."
+                } else {
+                    status = .warning
+                    message = "ADVERTENCIA: El disco tiene \(reallocatedSectors) sectores defectuosos reasignados. El hardware ha comenzado a degradarse físicamente, pero ha logrado aislar los sectores dañados por ahora. Vigilar de cerca."
+                }
+            } else if crcErrors > 50 {
+                status = .warning
+                message = "Alerta de Interfaz: Se detectaron \(crcErrors) errores de checksum (CRC) en la transferencia de datos. Esto indica que el cable de datos SATA está dañado, el conector está flojo o la alimentación es inestable."
+            }
+            
+            if let passed = smartStatus?.passed, !passed {
+                status = .failing
+                message = "AUTO-DIAGNÓSTICO DEL FIRMWARE (SMART): ¡FALLO INMINENTE DETECTADO! El propio firmware del disco ha declarado que la unidad va a fallar. Guarde su información y apague el equipo."
+            }
+        }
+        
+        return DiskDiagnosis(
+            status: status,
+            message: message,
+            criticalCount: criticalCount,
+            reallocatedSectors: reallocatedSectors,
+            pendingSectors: pendingSectors,
+            crcErrors: crcErrors
+        )
     }
 }
 
@@ -626,18 +813,25 @@ struct DiskDetailView: View {
                             .font(.largeTitle)
                             .fontWeight(.bold)
                         
-                        if let passed = scanResult?.smartStatus?.passed {
-                            Text(passed ? "HEALTHY" : "FAILING")
+                        if let result = scanResult {
+                            let diagnosis = result.runDiagnosis()
+                            Text(diagnosis.status.rawValue.uppercased())
                                 .font(.caption)
                                 .fontWeight(.bold)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
-                                .background(passed ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
-                                .foregroundColor(passed ? .green : .red)
+                                .background(
+                                    diagnosis.status == .healthy ? Color.green.opacity(0.2) : 
+                                    (diagnosis.status == .warning ? Color.orange.opacity(0.2) : Color.red.opacity(0.2))
+                                )
+                                .foregroundColor(
+                                    diagnosis.status == .healthy ? .green : 
+                                    (diagnosis.status == .warning ? .orange : .red)
+                                )
                                 .cornerRadius(5)
                         }
                     }
-                    Text("Protocol: \(scanResult?.device?.protocolName ?? "Unknown") | Serial: \(scanResult?.serialNumber ?? "N/A")")
+                    Text("Device Path: \(device.path) | Connection: \(device.isRemote ? "Remote SSH" : "Local Direct")")
                         .font(.body)
                         .foregroundColor(.secondary)
                 }
@@ -675,6 +869,124 @@ struct DiskDetailView: View {
             .background(Color(NSColor.windowBackgroundColor))
             
             Divider()
+            
+            // Rich Hardware & Health Diagnosis Panel (for average users)
+            if let result = scanResult {
+                VStack(alignment: .leading, spacing: 10) {
+                    // Hardware info grid
+                    HStack(spacing: 30) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("CAPACIDAD")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            Text(result.formattedCapacity)
+                                .font(.title3)
+                                .fontWeight(.bold)
+                        }
+                        
+                        Divider().frame(height: 35)
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("TIPO DE UNIDAD")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            Text(result.deviceTypeDescription)
+                                .font(.body)
+                                .fontWeight(.medium)
+                        }
+                        
+                        Divider().frame(height: 35)
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("NÚMERO DE SERIE")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            Text(result.serialNumber ?? "N/A")
+                                .font(.body)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Divider().frame(height: 35)
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("FIRMWARE")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            Text(result.firmwareVersion ?? "N/A")
+                                .font(.body)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                    .padding(.horizontal)
+                    .padding(.top)
+                    
+                    // Diagnosis Panel
+                    let diagnosis = result.runDiagnosis()
+                    HStack(alignment: .top, spacing: 15) {
+                        Image(systemName: diagnosis.iconName)
+                            .font(.system(size: 32))
+                            .foregroundColor(diagnosis.color)
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(diagnosis.title)
+                                .font(.title3)
+                                .fontWeight(.bold)
+                                .foregroundColor(diagnosis.color)
+                            
+                            Text(diagnosis.message)
+                                .font(.body)
+                                .foregroundColor(.primary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .lineLimit(nil)
+                            
+                            if diagnosis.status != .healthy {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if diagnosis.reallocatedSectors > 0 {
+                                        Text("• Sectores Reasignados: \(diagnosis.reallocatedSectors) (Sectores dañados físicamente aislados por el disco)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    if diagnosis.pendingSectors > 0 {
+                                        Text("• Sectores Pendientes: \(diagnosis.pendingSectors) (Sectores inestables con fallas activas de lectura/escritura)")
+                                            .font(.caption)
+                                            .foregroundColor(.red)
+                                            .fontWeight(.semibold)
+                                    }
+                                    if diagnosis.criticalCount > 0 {
+                                        Text("• Sectores Incorregibles (Offline): \(diagnosis.criticalCount) (Daño físico permanente en la superficie)")
+                                            .font(.caption)
+                                            .foregroundColor(.red)
+                                            .fontWeight(.bold)
+                                    }
+                                    if diagnosis.crcErrors > 0 {
+                                        Text("• Errores de Interfaz (CRC): \(diagnosis.crcErrors) (Problemas con el cable SATA, conector o energía)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                .padding(.top, 4)
+                            }
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(diagnosis.backgroundColor)
+                    .cornerRadius(10)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(diagnosis.strokeColor, lineWidth: 1)
+                    )
+                    .padding(.horizontal)
+                }
+            }
             
             if let error = scanManager.scanError {
                 VStack(alignment: .leading, spacing: 10) {
