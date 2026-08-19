@@ -161,13 +161,24 @@ class DiskScanManager: ObservableObject {
             return
         }
         
+        let isInternal = devicePath == "/dev/disk0"
+        
         let task = Task.detached(priority: .userInitiated) { () -> Result<SmartctlOutput, Error> in
             let process = Process()
             let pipe = Pipe()
             let errPipe = Pipe()
             
-            process.executableURL = URL(fileURLWithPath: self.smartctlPath)
-            process.arguments = ["--all", "--json", devicePath]
+            if isInternal {
+                // Run directly without elevated privileges for internal NVMe
+                process.executableURL = URL(fileURLWithPath: self.smartctlPath)
+                process.arguments = ["--all", "--json", devicePath]
+            } else {
+                // Use osascript with administrator privileges to prompt macOS password dialog for USB drives
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                let script = "do shell script \"\(self.smartctlPath) --all --json \(devicePath)\" with administrator privileges"
+                process.arguments = ["-e", script]
+            }
+            
             process.standardOutput = pipe
             process.standardError = errPipe
             
@@ -177,7 +188,13 @@ class DiskScanManager: ObservableObject {
                 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 
-                // Print raw output to console for debug
+                if data.isEmpty {
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errStr = String(data: errData, encoding: .utf8) ?? "User cancelled or denied authorization."
+                    return .failure(NSError(domain: "SmartMacApp", code: 1, userInfo: [NSLocalizedDescriptionKey: errStr]))
+                }
+                
+                // Print raw output for debugging
                 if let rawJSON = String(data: data, encoding: .utf8) {
                     print("--- Raw smartctl response ---\n", rawJSON)
                 }
@@ -197,7 +214,7 @@ class DiskScanManager: ObservableObject {
         case .success(let output):
             self.activeScanResult = output
         case .failure(let error):
-            self.scanError = "Detailed Error: \(String(describing: error))"
+            self.scanError = error.localizedDescription
         }
     }
 }
