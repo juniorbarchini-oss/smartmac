@@ -111,27 +111,39 @@ struct NVMESmartHealthLog: Decodable {
     }
 }
 
-// MARK: - Disk Info Model (Representable on UI)
-struct StorageDevice: Identifiable, Hashable {
-    let id = UUID()
-    let path: String // e.g. /dev/disk0
+// MARK: - Models for Storage and Remote Connections
+struct StorageDevice: Identifiable, Hashable, Codable {
+    let id: UUID
+    let path: String // e.g. /dev/disk0 or /dev/sda
     let name: String
     let size: String
     let isRemote: Bool
     let address: String?
+    let hostId: UUID?
 }
 
-// MARK: - Local SMART Executor
+struct RemoteHost: Identifiable, Hashable, Codable {
+    let id: UUID
+    let name: String
+    let ip: String
+    let port: String
+    let username: String
+    var selectedDisks: [String] // Disk paths e.g. ["/dev/sda", "/dev/sdb"]
+}
+
+// MARK: - Local SMART Executor & Host Manager
 class DiskScanManager: ObservableObject {
     @Published var isScanning = false
     @Published var scanError: String?
     @Published var activeScanResult: SmartctlOutput?
     @Published var detectedDisks: [StorageDevice] = []
+    @Published var remoteHosts: [RemoteHost] = []
     
     private let smartctlPath = "/opt/homebrew/bin/smartctl"
     
     init() {
         refreshDiskList()
+        loadRemoteHosts()
     }
     
     func refreshDiskList() {
@@ -166,16 +178,18 @@ class DiskScanManager: ObservableObject {
                 self.detectedDisks = physicalPaths.map { path in
                     let isMain = path == "/dev/disk0"
                     return StorageDevice(
+                        id: UUID(),
                         path: path,
                         name: isMain ? "Macintosh SSD (\(path))" : "External USB Drive (\(path))",
                         size: isMain ? "Internal Health Check" : "External Health Check",
                         isRemote: false,
-                        address: nil
+                        address: nil,
+                        hostId: nil
                     )
                 }
             }
         } catch {
-            self.detectedDisks = [StorageDevice(path: "/dev/disk0", name: "Macintosh SSD (/dev/disk0)", size: "Internal Health Check", isRemote: false, address: nil)]
+            self.detectedDisks = [StorageDevice(id: UUID(), path: "/dev/disk0", name: "Macintosh SSD (/dev/disk0)", size: "Internal Health Check", isRemote: false, address: nil, hostId: nil)]
         }
     }
     
@@ -197,19 +211,97 @@ class DiskScanManager: ObservableObject {
         return FileManager.default.fileExists(atPath: smartctlPath)
     }
     
+    // MARK: - Remote SSH Hosts Persistance
+    func loadRemoteHosts() {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: "remote_hosts_data") {
+            if let decoded = try? JSONDecoder().decode([RemoteHost].self, from: data) {
+                self.remoteHosts = decoded
+            }
+        }
+    }
+    
+    func saveRemoteHosts() {
+        if let encoded = try? JSONEncoder().encode(remoteHosts) {
+            UserDefaults.standard.set(encoded, forKey: "remote_hosts_data")
+        }
+    }
+    
+    func addRemoteHost(_ host: RemoteHost) {
+        remoteHosts.removeAll(where: { $0.ip == host.ip })
+        remoteHosts.append(host)
+        saveRemoteHosts()
+    }
+    
+    func removeRemoteHost(_ host: RemoteHost) {
+        remoteHosts.removeAll(where: { $0.id == host.id })
+        saveRemoteHosts()
+    }
+    
+    // MARK: - Scan Executor (Local & SSH Simulation)
     @MainActor
-    func runScan(on devicePath: String) async {
+    func runScan(on device: StorageDevice) async {
         isScanning = true
         scanError = nil
         activeScanResult = nil
         
+        if device.isRemote {
+            // Simulated SSH Scan
+            // In the production version, this will open a Citadel SSH channel and run:
+            // "sudo smartctl --all --json [device.path]"
+            try? await Task.sleep(nanoseconds: 1_500_000_000) // Simulating network latency
+            isScanning = false
+            
+            // Build mock smartctl JSON response representing a healthy Linux RAID / Enterprise SSD
+            let mockJSON = """
+            {
+              "model_name": "Intel D3-S4510 3.84TB",
+              "serial_number": "PHDV824901AZ3P8GN",
+              "firmware_version": "XCV10120",
+              "device": {
+                "name": "\(device.path)",
+                "protocol": "SATA"
+              },
+              "smart_status": {
+                "passed": true
+              },
+              "temperature": {
+                "current": 37
+              },
+              "power_cycle_count": 42,
+              "power_on_time": {
+                "hours": 14520
+              },
+              "ata_smart_attributes": {
+                "table": [
+                  { "id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "threshold": 10, "raw": { "value": 0, "string": "0" } },
+                  { "id": 9, "name": "Power_On_Hours", "value": 90, "worst": 90, "threshold": 0, "raw": { "value": 14520, "string": "14520" } },
+                  { "id": 12, "name": "Power_Cycle_Count", "value": 100, "worst": 100, "threshold": 0, "raw": { "value": 42, "string": "42" } },
+                  { "id": 194, "name": "Temperature_Celsius", "value": 63, "worst": 50, "threshold": 0, "raw": { "value": 37, "string": "37 (Min/Max 18/51)" } }
+                ]
+              }
+            }
+            """
+            
+            if let data = mockJSON.data(using: .utf8) {
+                do {
+                    let decoded = try JSONDecoder().decode(SmartctlOutput.self, from: data)
+                    self.activeScanResult = decoded
+                } catch {
+                    self.scanError = "Failed to parse remote data: \(error.localizedDescription)"
+                }
+            }
+            return
+        }
+        
+        // Local Scan Logic
         guard checkSmartctlAvailability() else {
             isScanning = false
             scanError = "smartctl binary not found. Please install it using Homebrew:\nbrew install smartmontools"
             return
         }
         
-        let isInternal = devicePath == "/dev/disk0"
+        let isInternal = device.path == "/dev/disk0"
         
         let task = Task.detached(priority: .userInitiated) { () -> Result<SmartctlOutput, Error> in
             let process = Process()
@@ -217,13 +309,11 @@ class DiskScanManager: ObservableObject {
             let errPipe = Pipe()
             
             if isInternal {
-                // Run directly without elevated privileges for internal NVMe
                 process.executableURL = URL(fileURLWithPath: self.smartctlPath)
-                process.arguments = ["--all", "--json", devicePath]
+                process.arguments = ["--all", "--json", device.path]
             } else {
-                // Use osascript with administrator privileges to prompt macOS password dialog for USB drives
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                let script = "do shell script \"\(self.smartctlPath) --all --json \(devicePath) || true\" with administrator privileges"
+                let script = "do shell script \"\(self.smartctlPath) --all --json \(device.path) || true\" with administrator privileges"
                 process.arguments = ["-e", script]
             }
             
@@ -242,11 +332,6 @@ class DiskScanManager: ObservableObject {
                     return .failure(NSError(domain: "SmartMacApp", code: 1, userInfo: [NSLocalizedDescriptionKey: errStr]))
                 }
                 
-                // Print raw output for debugging
-                if let rawJSON = String(data: data, encoding: .utf8) {
-                    print("--- Raw smartctl response ---\n", rawJSON)
-                }
-                
                 let decoder = JSONDecoder()
                 let decoded = try decoder.decode(SmartctlOutput.self, from: data)
                 return .success(decoded)
@@ -262,7 +347,7 @@ class DiskScanManager: ObservableObject {
         case .success(let output):
             self.activeScanResult = output
         case .failure(let error):
-            self.scanError = "Execution Error:\n\(error.localizedDescription)\n\nRaw: \(String(describing: error))"
+            self.scanError = error.localizedDescription
         }
     }
 }
@@ -292,6 +377,38 @@ struct ContentView: View {
                                 Image(systemName: device.path == "/dev/disk0" ? "internaldrive" : "externaldrive")
                                     .imageScale(.large)
                                     .foregroundColor(device.path == "/dev/disk0" ? .blue : .purple)
+                            }
+                        }
+                    }
+                }
+                
+                // Dynamic Network Hosts from User Configuration
+                ForEach(scanManager.remoteHosts) { host in
+                    Section("Host: \(host.name)") {
+                        ForEach(host.selectedDisks, id: \.self) { diskPath in
+                            let dev = StorageDevice(
+                                id: UUID(),
+                                path: diskPath,
+                                name: "Disk \(diskPath.components(separatedBy: "/").last ?? diskPath)",
+                                size: "Remote SSH Node",
+                                isRemote: true,
+                                address: host.ip,
+                                hostId: host.id
+                            )
+                            NavigationLink(value: dev) {
+                                Label {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(dev.name)
+                                            .font(.headline)
+                                        Text(host.ip)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                } icon: {
+                                    Image(systemName: "server.rack")
+                                        .imageScale(.large)
+                                        .foregroundColor(.teal)
+                                }
                             }
                         }
                     }
@@ -336,7 +453,7 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView(selectedTheme: $selectedTheme)
+            SettingsView(selectedTheme: $selectedTheme, scanManager: scanManager)
         }
         .preferredColorScheme(selectedTheme.colorScheme)
     }
@@ -352,9 +469,9 @@ struct DiskDetailView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Disk Header
             HStack(spacing: 15) {
-                Image(systemName: device.path == "/dev/disk0" ? "internaldrive" : "externaldrive")
+                Image(systemName: device.isRemote ? "server.rack" : (device.path == "/dev/disk0" ? "internaldrive" : "externaldrive"))
                     .font(.system(size: 40))
-                    .foregroundColor(.blue)
+                    .foregroundColor(device.isRemote ? .teal : .blue)
                 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -384,7 +501,7 @@ struct DiskDetailView: View {
                         .padding(.trailing, 10)
                 } else {
                     HStack(spacing: 10) {
-                        if device.path != "/dev/disk0" {
+                        if !device.isRemote && device.path != "/dev/disk0" {
                             Button(action: {
                                 scanManager.ejectDevice(devicePath: device.path)
                             }) {
@@ -397,7 +514,7 @@ struct DiskDetailView: View {
                         
                         Button(action: {
                             Task {
-                                await scanManager.runScan(on: device.path)
+                                await scanManager.runScan(on: device)
                             }
                         }) {
                             Label("Scan Now", systemImage: "play.fill")
@@ -464,7 +581,7 @@ struct DiskDetailView: View {
     }
 }
 
-// MARK: - Real Overview Tab (Displays Decoded JSON values)
+// MARK: - Real Overview Tab
 struct RealOverviewTab: View {
     let result: SmartctlOutput
     
@@ -475,7 +592,6 @@ struct RealOverviewTab: View {
                 .fontWeight(.bold)
             
             Grid(alignment: .leading, horizontalSpacing: 25, verticalSpacing: 15) {
-                // 1. Common Temperature
                 if let temp = result.temperature?.current {
                     GridRow {
                         Text("Temperature:")
@@ -489,7 +605,6 @@ struct RealOverviewTab: View {
                     }
                 }
                 
-                // 2. Remaining Life / SMART Health Status
                 if let log = result.nvmeSmartHealthInformationLog {
                     let healthPct = 100 - log.percentageUsed
                     GridRow {
@@ -517,7 +632,6 @@ struct RealOverviewTab: View {
                     }
                 }
                 
-                // 3. Common Power Cycles
                 if let cycles = result.powerCycleCount {
                     GridRow {
                         Text("Power Cycles:")
@@ -526,7 +640,6 @@ struct RealOverviewTab: View {
                     }
                 }
                 
-                // 4. Common Power On Hours
                 if let hours = result.powerOnTime?.hours {
                     GridRow {
                         Text("Power On Hours:")
@@ -535,7 +648,6 @@ struct RealOverviewTab: View {
                     }
                 }
                 
-                // 5. NVMe Data Units (specific)
                 if let log = result.nvmeSmartHealthInformationLog {
                     GridRow {
                         Text("Data Units Written:")
@@ -553,14 +665,12 @@ struct RealOverviewTab: View {
                     }
                 }
                 
-                // 6. Protocol Name
                 GridRow {
                     Text("Connection Protocol:")
                         .fontWeight(.semibold)
                     Text(result.device?.protocolName ?? "Unknown")
                 }
                 
-                // Fallback explanation if no common metrics are found at all
                 if result.temperature?.current == nil && result.smartStatus == nil {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("✓ Password accepted. Raw connection established.")
@@ -605,7 +715,6 @@ struct RealMetricsTab: View {
                 .frame(height: 250)
                 .cornerRadius(10)
             } else if let ata = result.ataSmartAttributes {
-                // Show SATA/ATA attributes in a neat table
                 Table(ata.table) {
                     TableColumn("ID") { attr in
                         Text("\(attr.id)")
@@ -672,40 +781,238 @@ struct MetricRow: View {
     }
 }
 
-// MARK: - Settings View (Sheet)
+// MARK: - Settings View & Host Discovery UI
 struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
     @Binding var selectedTheme: AppTheme
+    @ObservedObject var scanManager: DiskScanManager
+    
+    // Add Host states
+    @State private var showingAddHost = false
+    @State private var hostName = ""
+    @State private var hostIp = ""
+    @State private var hostPort = "22"
+    @State private var hostUser = ""
+    @State private var hostPassword = ""
+    
+    // Discovery states
+    @State private var isDiscovering = false
+    @State private var discoveredDisks: [String] = []
+    @State private var selectedDisks: Set<String> = []
+    @State private var discoveryError: String?
     
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("SmartMac Settings")
+            Text("Settings")
                 .font(.title)
                 .fontWeight(.bold)
             
-            Form {
-                Picker("Appearance Theme:", selection: $selectedTheme) {
-                    ForEach(AppTheme.allCases) { theme in
-                        Text(theme.rawValue).tag(theme)
+            TabView {
+                // TAB 1: General Preferences
+                Form {
+                    Picker("Appearance Theme:", selection: $selectedTheme) {
+                        ForEach(AppTheme.allCases) { theme in
+                            Text(theme.rawValue).tag(theme)
+                        }
+                    }
+                    .pickerStyle(RadioGroupPickerStyle())
+                    .padding(.vertical, 5)
+                }
+                .tabItem {
+                    Label("General", systemImage: "slider.horizontal.3")
+                }
+                
+                // TAB 2: Network Hosts Management
+                VStack(alignment: .leading, spacing: 10) {
+                    if showingAddHost {
+                        // MARK: - Add Host Form & Disk Discovery
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Add Remote Server (SSH)").font(.headline)
+                                
+                                Group {
+                                    TextField("Host Nickname (e.g. Synology NAS)", text: $hostName)
+                                    TextField("IP Address or Hostname", text: $hostIp)
+                                    TextField("SSH Port (Default 22)", text: $hostPort)
+                                    TextField("SSH Username (root or admin)", text: $hostUser)
+                                    SecureField("SSH Password", text: $hostPassword)
+                                }
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                                
+                                if let err = discoveryError {
+                                    Text(err)
+                                        .font(.caption)
+                                        .foregroundColor(.red)
+                                }
+                                
+                                HStack {
+                                    if isDiscovering {
+                                        ProgressView().controlSize(.small)
+                                        Text("Discovering physical disks via SSH...")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    } else {
+                                        Button("Connect & Discover Disks") {
+                                            discoverRemoteDisks()
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .disabled(hostIp.isEmpty || hostUser.isEmpty || hostPassword.isEmpty)
+                                    }
+                                }
+                                
+                                if !discoveredDisks.isEmpty {
+                                    Divider()
+                                    HStack {
+                                        Text("Select Disks to Monitor:").fontWeight(.semibold)
+                                        Spacer()
+                                        Button("Select All") {
+                                            selectedDisks = Set(discoveredDisks)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .foregroundColor(.blue)
+                                        
+                                        Button("Deselect All") {
+                                            selectedDisks.removeAll()
+                                        }
+                                        .buttonStyle(.plain)
+                                        .foregroundColor(.secondary)
+                                    }
+                                    
+                                    ForEach(discoveredDisks, id: \.self) { disk in
+                                        Toggle(disk, isOn: Binding(
+                                            get: { selectedDisks.contains(disk) },
+                                            set: { isOn in
+                                                if isOn {
+                                                    selectedDisks.insert(disk)
+                                                } else {
+                                                    selectedDisks.remove(disk)
+                                                }
+                                            }
+                                        ))
+                                    }
+                                    .padding(.leading, 5)
+                                }
+                            }
+                            .padding(.trailing, 10)
+                        }
+                        
+                        HStack {
+                            Button("Cancel") {
+                                showingAddHost = false
+                                resetHostFields()
+                            }
+                            Spacer()
+                            Button("Save Host") {
+                                saveHost()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(hostName.isEmpty || selectedDisks.isEmpty)
+                        }
+                        .padding(.top, 10)
+                    } else {
+                        // MARK: - Hosts List View
+                        HStack {
+                            Text("Configured Servers").font(.headline)
+                            Spacer()
+                            Button(action: { showingAddHost = true }) {
+                                Label("Add Server", systemImage: "plus")
+                            }
+                        }
+                        
+                        List {
+                            if scanManager.remoteHosts.isEmpty {
+                                Text("No remote servers configured. Click 'Add Server' to monitor a NAS or Linux system.")
+                                    .foregroundColor(.secondary)
+                                    .font(.caption)
+                                    .padding()
+                            } else {
+                                ForEach(scanManager.remoteHosts) { host in
+                                    HStack {
+                                        VStack(alignment: .leading) {
+                                            Text(host.name).font(.headline)
+                                            Text("\(host.username)@\(host.ip):\(host.port)")
+                                                .font(.caption).foregroundColor(.secondary)
+                                            Text("\(host.selectedDisks.count) disks monitored")
+                                                .font(.caption2).foregroundColor(.teal)
+                                        }
+                                        Spacer()
+                                        Button(action: { scanManager.removeRemoteHost(host) }) {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.plain)
+                                        .foregroundColor(.red)
+                                    }
+                                }
+                            }
+                        }
+                        .cornerRadius(8)
                     }
                 }
-                .pickerStyle(RadioGroupPickerStyle())
-                .padding(.vertical, 5)
-            }
-            
-            Spacer()
-            
-            HStack {
-                Spacer()
-                Button("Done") {
-                    dismiss()
+                .tabItem {
+                    Label("Network Hosts (SSH)", systemImage: "network")
                 }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
+            }
+            .padding(.bottom, 10)
+            
+            if !showingAddHost {
+                HStack {
+                    Spacer()
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .padding()
-        .frame(width: 400, height: 250)
+        .frame(width: 500, height: 480)
+    }
+    
+    // MARK: - Simulation of Disk Discovery over SSH
+    private func discoverRemoteDisks() {
+        isDiscovering = true
+        discoveryError = nil
+        discoveredDisks = []
+        
+        // Simulating the SSH shell command execution:
+        // "ssh user@host 'sudo smartctl --scan --json'"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+            self.isDiscovering = false
+            // Simulation result based on standard Linux setups (e.g. TrueNAS or Synology)
+            self.discoveredDisks = [
+                "/dev/sda", // Main SATA SSD
+                "/dev/sdb", // Storage Pool HDD 1
+                "/dev/sdc", // Storage Pool HDD 2
+                "/dev/nvme0n1" // Cache NVMe M.2
+            ]
+            self.selectedDisks = ["/dev/sda"] // Select the first one by default
+        }
+    }
+    
+    private func saveHost() {
+        let newHost = RemoteHost(
+            id: UUID(),
+            name: hostName,
+            ip: hostIp,
+            port: hostPort,
+            username: hostUser,
+            selectedDisks: Array(selectedDisks).sorted()
+        )
+        scanManager.addRemoteHost(newHost)
+        showingAddHost = false
+        resetHostFields()
+    }
+    
+    private func resetHostFields() {
+        hostName = ""
+        hostIp = ""
+        hostPort = "22"
+        hostUser = ""
+        hostPassword = ""
+        discoveredDisks = []
+        selectedDisks = []
+        discoveryError = nil
     }
 }
 
