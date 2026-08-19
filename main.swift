@@ -309,7 +309,9 @@ struct NVMESmartHealthLog: Decodable {
 
 // MARK: - Models for Storage and Remote Connections
 struct StorageDevice: Identifiable, Hashable, Codable {
-    let id: UUID
+    var id: String {
+        return "\(hostId?.uuidString ?? "local")-\(path)"
+    }
     let path: String
     let name: String
     let size: String
@@ -375,7 +377,6 @@ class DiskScanManager: ObservableObject {
                 self.detectedDisks = physicalPaths.map { path in
                     let isMain = path == "/dev/disk0"
                     return StorageDevice(
-                        id: UUID(),
                         path: path,
                         name: isMain ? "Macintosh SSD (\(path))" : "External USB Drive (\(path))",
                         size: isMain ? "Internal Health Check" : "External Health Check",
@@ -386,7 +387,7 @@ class DiskScanManager: ObservableObject {
                 }
             }
         } catch {
-            self.detectedDisks = [StorageDevice(id: UUID(), path: "/dev/disk0", name: "Macintosh SSD (/dev/disk0)", size: "Internal Health Check", isRemote: false, address: nil, hostId: nil)]
+            self.detectedDisks = [StorageDevice(path: "/dev/disk0", name: "Macintosh SSD (/dev/disk0)", size: "Internal Health Check", isRemote: false, address: nil, hostId: nil)]
         }
     }
     
@@ -713,7 +714,6 @@ struct ContentView: View {
                     Section("Host: \(host.name)") {
                         ForEach(host.selectedDisks, id: \.self) { diskPath in
                             let dev = StorageDevice(
-                                id: UUID(),
                                 path: diskPath,
                                 name: "Disk \(diskPath.components(separatedBy: "/").last ?? diskPath)",
                                 size: "Remote SSH Node",
