@@ -1,33 +1,78 @@
-# SmartMacApp
+# SmartMac
 
-A native macOS storage diagnostic dashboard designed to centralize the health, S.M.A.R.T. statistics, and performance of local internal drives, external USB enclosures, and remote network hosts (via SSH) with **on-demand scans** and zero persistent background overhead.
+⚡ **SmartMac** is a native macOS storage diagnostic utility and S.M.A.R.T. telemetry dashboard. It is designed to inspect, monitor, and export health analytics of local drives (internal and external USB enclosures) as well as remote network servers (NAS, Linux hosts) under a single, cohesive interface.
 
-## Philosophy
+Designed with an **on-demand philosophy**, SmartMac runs only when you need it, leaving zero persistent daemons or background processes to consume your Mac's CPU, RAM, or battery.
 
-*   **On-Demand:** Runs only when opened, avoiding continuous CPU/battery drain.
-*   **Agentless Remote Scanning:** Direct SSH connections using Swift's native Citadel library to execute commands on remote servers (NAS, Linux hosts) without local agent installations.
-*   **Dynamic Theme Selection:** Settings options to choose between Light Mode, Dark Mode, or Automatic (System Default).
+---
 
-## How to Compile & Run
+## Features
 
-We have prepared a light build script that compiles the Swift code using your local macOS SDK and packages it as a native `.app` bundle, which you can run immediately without opening Xcode.
+- **Apple Silicon SSD Lifespan Projections:** Estimator algorithm that projects remaining lifespan in years and TBW (Terabytes Written) based on actual power-on hours and write wear, with smart calibration to prevent false anomalies on new drives.
+- **Hierarchical Sidebar (Finder-Style):** Organizes local and remote physical storage devices by host.
+- **Consolidated Export Sheets:** Generate comprehensive diagnostic reports in a single file:
+  - **Markdown (.md)** for easy Obsidian indexing.
+  - **Word Document (.doc)** styled with HTML templates.
+  - **Excel/CSV (.csv)** consolidating all selected metrics.
+  - **PDF Document (.pdf)** rendering a multi-page, high-resolution vector layout page-by-page.
+- **Agentless Remote Monitoring:** Inspect servers, NAS units, or Linux hosts securely over SSH using system bridges.
+- **Dynamic USB Mounting Support:** Automatically registers when a USB drive is plugged in or safely ejected, updating the sidebar in real time.
+- **Dynamic Path Resolution:** Automatically locates `smartctl` binaries on both **Apple Silicon** (Homebrew `/opt/homebrew`) and **Intel** (Homebrew `/usr/local`) macOS architectures.
+- **Dark Mode & Appearance:** Toggle between Light Mode, Dark Mode, or Automatic System Theme.
 
-1.  Open your Terminal.
-2.  Navigate to this project folder:
-    ```bash
-    cd "/Users/hbarchini/Documents/desarrollo/smartmac-app"
-    ```
-3.  Compile the application:
-    ```bash
-    ./build.sh
-    ```
-4.  Open and run the compiled application:
-    ```bash
-    open SmartMac.app
-    ```
+---
 
-## Project Files
+## Requirements
 
-*   `main.swift`: The single-entry Swift source code implementing the SwiftUI user interface, mock models, and data sheets.
-*   `Info.plist`: Key-value application property list identifying the executable and system version targets.
-*   `build.sh`: Automated terminal script to build, compile, and structure the native macOS application bundle.
+### Local Drive Scanning
+To read local S.M.A.R.T. telemetry on macOS, the application requires the `smartctl` utility. You can install it easily using Homebrew:
+```bash
+brew install smartmontools
+```
+
+### Remote Server Scanning
+No local installation is required on your Mac to scan remote servers. The remote host (e.g., Ubuntu, Debian, TrueNAS) simply needs SSH enabled and `smartctl` installed:
+```bash
+# Ubuntu / Debian
+sudo apt install smartmontools
+```
+
+---
+
+## Compilation & Installation
+
+You can compile the Swift source code into a native macOS application bundle (`.app`) without opening Xcode.
+
+1. **Clone the Repository:**
+   ```bash
+   git clone https://github.com/juniorbarchini-oss/smartmac.git
+   cd smartmac
+   ```
+
+2. **Run the Build Script:**
+   ```bash
+   chmod +x build.sh
+   ./build.sh
+   ```
+
+3. **Launch the App:**
+   The compiled bundle will be created at the root directory as `SmartMac.app`. Run it by typing:
+   ```bash
+   open SmartMac.app
+   ```
+
+---
+
+## Project Structure
+
+- `main.swift`: Monolithic Swift source file containing the SwiftUI layouts, SSH execution bridges, and CoreGraphics PDF rendering engines.
+- `Info.plist`: Key-value application property configuration file containing version identifiers and target SDK requirements.
+- `AppIcon.icns`: Compiled macOS high-resolution icon bundle.
+- `build.sh`: Shell script to compile, structure, and package the binary into a native Apple application bundle.
+
+---
+
+## Credits
+
+- **Concept, Design & Development:** Humberto Barchini (HB) & Antigravity (AGY)
+- **License:** Open Source under the MIT License.
