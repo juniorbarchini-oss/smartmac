@@ -76,3 +76,15 @@ You can compile the Swift source code into a native macOS application bundle (`.
 
 - **Concept, Design & Development:** Humberto Barchini (HB) & Antigravity (AGY)
 - **License:** Open Source under the MIT License.
+
+---
+
+## 🌟 Support & Donations
+
+If you find SmartMac useful, you can support the project in two ways:
+
+1. **Star the Repository:** Click the ⭐ button at the top right of this page to show your support and make the project more visible to other administrators.
+2. **Buy Me a Coffee:** If the tool saved you time or database diagnostic headaches, feel free to support our work:
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange?style=for-the-badge&logo=buy-me-a-coffee&logoColor=white)](https://www.buymeacoffee.com/YOUR_USERNAME)
+
