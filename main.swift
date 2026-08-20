@@ -479,7 +479,16 @@ class DiskScanManager: ObservableObject {
     @Published var allDevices: [StorageDevice] = []
     @Published var hostStatus: [UUID: Bool] = [:]
     
-    private let smartctlPath = "/opt/homebrew/bin/smartctl"
+    private var smartctlPath: String {
+        let siliconPath = "/opt/homebrew/bin/smartctl"
+        let intelPath = "/usr/local/bin/smartctl"
+        if FileManager.default.fileExists(atPath: siliconPath) {
+            return siliconPath
+        } else if FileManager.default.fileExists(atPath: intelPath) {
+            return intelPath
+        }
+        return siliconPath
+    }
     private var reachabilityTimer: Timer?
     
     init() {
@@ -638,7 +647,9 @@ class DiskScanManager: ObservableObject {
     }
     
     func checkSmartctlAvailability() -> Bool {
-        return FileManager.default.fileExists(atPath: smartctlPath)
+        let siliconPath = "/opt/homebrew/bin/smartctl"
+        let intelPath = "/usr/local/bin/smartctl"
+        return FileManager.default.fileExists(atPath: siliconPath) || FileManager.default.fileExists(atPath: intelPath)
     }
     
     // MARK: - Remote SSH Hosts Persistance
