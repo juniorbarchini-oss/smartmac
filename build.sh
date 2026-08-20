@@ -11,5 +11,8 @@ mkdir -p SmartMac.app/Contents/Resources
 
 cp SmartMac SmartMac.app/Contents/MacOS/SmartMac
 cp Info.plist SmartMac.app/Contents/Info.plist
+if [ -f AppIcon.icns ]; then
+    cp AppIcon.icns SmartMac.app/Contents/Resources/AppIcon.icns
+fi
 
 echo "Application built successfully at: $(pwd)/SmartMac.app"

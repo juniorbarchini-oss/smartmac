@@ -19,6 +19,11 @@ enum AppTheme: String, CaseIterable, Identifiable {
 }
 
 // MARK: - Smartctl Output Model
+struct SmartSupportInfo: Decodable {
+    let available: Bool?
+    let enabled: Bool?
+}
+
 struct SmartctlOutput: Decodable {
     let modelName: String?
     let serialNumber: String?
@@ -32,6 +37,10 @@ struct SmartctlOutput: Decodable {
     let ataSmartAttributes: ATASmartAttributes?
     let userCapacity: UserCapacityInfo?
     let rotationRate: Int?
+    let logicalBlockSize: Int?
+    let physicalBlockSize: Int?
+    let smartSupport: SmartSupportInfo?
+    let nvmeTotalCapacity: Int64?
     
     enum CodingKeys: String, CodingKey {
         case modelName = "model_name"
@@ -46,11 +55,112 @@ struct SmartctlOutput: Decodable {
         case ataSmartAttributes = "ata_smart_attributes"
         case userCapacity = "user_capacity"
         case rotationRate = "rotation_rate"
+        case logicalBlockSize = "logical_block_size"
+        case physicalBlockSize = "physical_block_size"
+        case smartSupport = "smart_support"
+        case nvmeTotalCapacity = "nvme_total_capacity"
+    }
+    
+    var storageTechnology: String {
+        let proto = device?.protocolName?.uppercased() ?? ""
+        if proto.contains("NVME") {
+            return "Solid State Drive (NVMe SSD)"
+        }
+        if let rate = rotationRate {
+            if rate == 0 {
+                return "Solid State Drive (SATA SSD)"
+            } else {
+                return "Mechanical Hard Disk Drive (HDD - \(rate) RPM)"
+            }
+        }
+        if proto.contains("SATA") || proto.contains("ATA") {
+            return "Solid State Drive (SATA SSD) / HDD"
+        }
+        return "Solid State / Flash Storage"
+    }
+}
+
+struct SSDWearEstimation {
+    let totalTBWritten: Double
+    let standardTBW: Double
+    let remainingTB: Double
+    let dailyWriteAverageGB: Double
+    let estimatedYearsRemaining: Double?
+    let healthRating: String
+}
+
+extension SmartctlOutput {
+    func estimateWear() -> SSDWearEstimation? {
+        guard let log = nvmeSmartHealthInformationLog,
+              let powerOnHours = log.powerOnHours, powerOnHours > 0,
+              let dataUnitsWritten = log.dataUnitsWritten else {
+            return nil
+        }
+        
+        let bytesWritten = Double(dataUnitsWritten) * 1000 * 512
+        let totalTBWritten = bytesWritten / (1024 * 1024 * 1024 * 1024)
+        
+        let capacityBytes = userCapacity?.bytes ?? nvmeTotalCapacity ?? 0
+        let capacityGB = Double(capacityBytes) / (1000 * 1000 * 1000)
+        
+        var standardTBW: Double = 600.0
+        if capacityGB <= 300 {
+            standardTBW = 150.0
+        } else if capacityGB <= 600 {
+            standardTBW = 300.0
+        } else if capacityGB <= 1200 {
+            standardTBW = 600.0
+        } else if capacityGB <= 2400 {
+            standardTBW = 1200.0
+        } else {
+            standardTBW = 2400.0
+        }
+        
+        let remainingTB = max(0, standardTBW - totalTBWritten)
+        let daysUsed = Double(powerOnHours) / 24.0
+        let safeDaysUsed = max(0.1, daysUsed)
+        let dailyWriteAverageTB = totalTBWritten / safeDaysUsed
+        let dailyWriteAverageGB = dailyWriteAverageTB * 1024.0
+        
+        let pctUsed = log.percentageUsed ?? 0
+        var estimatedYearsRemaining: Double? = nil
+        if dailyWriteAverageTB > 0 {
+            let daysRemaining = remainingTB / dailyWriteAverageTB
+            let rawYears = daysRemaining / 365.0
+            
+            // If the drive has low hours of usage or physical wear is low, 
+            // the low years estimation is a result of initial write spikes.
+            if powerOnHours < 1000 || (pctUsed < 5 && rawYears < 5.0) {
+                estimatedYearsRemaining = nil
+            } else {
+                estimatedYearsRemaining = rawYears
+            }
+        }
+        
+        var healthRating = "Excellent"
+        if pctUsed > 20 {
+            healthRating = "Caution"
+        } else if pctUsed > 10 {
+            healthRating = "Fair"
+        } else if pctUsed > 2 {
+            healthRating = "Good"
+        }
+        
+        return SSDWearEstimation(
+            totalTBWritten: totalTBWritten,
+            standardTBW: standardTBW,
+            remainingTB: remainingTB,
+            dailyWriteAverageGB: dailyWriteAverageGB,
+            estimatedYearsRemaining: estimatedYearsRemaining,
+            healthRating: healthRating
+        )
     }
 }
 
 struct UserCapacityInfo: Decodable {
     let bytes: Int64?
+    let blocks: Int64?
+    let text: String?
 }
 
 enum HealthStatus: String {
@@ -169,21 +279,25 @@ extension SmartctlOutput {
         
         // 1. Diagnosis for NVMe
         if let nvme = nvmeSmartHealthInformationLog {
-            if nvme.mediaErrors > 0 {
+            let mediaErr = nvme.mediaErrors ?? 0
+            let critWarn = nvme.criticalWarning ?? 0
+            let pctUsed = nvme.percentageUsed ?? 0
+            
+            if mediaErr > 0 {
                 status = .critical
-                message = "CRITICAL ALERT: Detected \(nvme.mediaErrors) data integrity and physical media errors. Your files are at risk of corruption. Back up immediately!"
-                criticalCount += nvme.mediaErrors
+                message = "CRITICAL ALERT: Detected \(mediaErr) data integrity and physical media errors. Your files are at risk of corruption. Back up immediately!"
+                criticalCount += mediaErr
             }
-            if nvme.criticalWarning > 0 {
+            if critWarn > 0 {
                 status = .failing
-                message = "IMMINENT FAILURE: NVMe controller reports critical hardware warnings (Code: \(nvme.criticalWarning)). The drive is failing or in write-protection read-only mode."
+                message = "IMMINENT FAILURE: NVMe controller reports critical hardware warnings (Code: \(critWarn)). The drive is failing or in write-protection read-only mode."
                 criticalCount += 1
             }
-            if nvme.percentageUsed >= 95 {
+            if pctUsed >= 95 {
                 if status != .failing && status != .critical {
                     status = .warning
                 }
-                message = "Drive Wearout: Life used is \(nvme.percentageUsed)%. The drive is approaching the end of its operational lifespan."
+                message = "Drive Wearout: Life used is \(pctUsed)%. The drive is approaching the end of its operational lifespan."
             }
             
             return DiskDiagnosis(
@@ -191,7 +305,7 @@ extension SmartctlOutput {
                 message: message,
                 criticalCount: criticalCount,
                 reallocatedSectors: 0,
-                pendingSectors: nvme.mediaErrors,
+                pendingSectors: mediaErr,
                 crcErrors: 0
             )
         }
@@ -199,17 +313,19 @@ extension SmartctlOutput {
         // 2. Diagnosis for SATA/ATA
         if let table = ataSmartAttributes?.table {
             for attr in table {
-                switch attr.id {
-                case 5:
-                    reallocatedSectors = attr.raw?.value ?? 0
-                case 197:
-                    pendingSectors = attr.raw?.value ?? 0
-                case 198:
-                    criticalCount += attr.raw?.value ?? 0
-                case 199:
-                    crcErrors = attr.raw?.value ?? 0
-                default:
-                    break
+                if let id = attr.id {
+                    switch id {
+                    case 5:
+                        reallocatedSectors = attr.raw?.value ?? 0
+                    case 197:
+                        pendingSectors = attr.raw?.value ?? 0
+                    case 198:
+                        criticalCount += attr.raw?.value ?? 0
+                    case 199:
+                        crcErrors = attr.raw?.value ?? 0
+                    default:
+                        break
+                    }
                 }
             }
             
@@ -229,7 +345,7 @@ extension SmartctlOutput {
                 message = "Interface Alert: Detected \(crcErrors) checksum (CRC) errors in data transfer. This indicates the SATA data cable might be damaged, the connector is loose, or power is unstable."
             }
             
-            if let passed = smartStatus?.passed, !passed {
+            if let passed = smartStatus?.passed, passed == false {
                 status = .failing
                 message = "FIRMWARE SELF-TEST (SMART): IMMINENT FAILURE DETECTED! The drive's own firmware has declared that the unit is about to fail. Back up your data and power off the machine."
             }
@@ -247,7 +363,7 @@ extension SmartctlOutput {
 }
 
 struct TemperatureInfo: Decodable {
-    let current: Int
+    let current: Int?
 }
 
 struct PowerOnTimeInfo: Decodable {
@@ -255,12 +371,12 @@ struct PowerOnTimeInfo: Decodable {
 }
 
 struct ATASmartAttributes: Decodable {
-    let table: [ATAAttribute]
+    let table: [ATAAttribute]?
 }
 
 struct ATAAttribute: Decodable, Identifiable {
-    let id: Int
-    let name: String
+    let id: Int?
+    let name: String?
     let value: Int?
     let worst: Int?
     let threshold: Int?
@@ -282,7 +398,7 @@ struct ATAAttribute: Decodable, Identifiable {
 }
 
 struct DeviceInfo: Decodable {
-    let name: String
+    let name: String?
     let protocolName: String?
     
     enum CodingKeys: String, CodingKey {
@@ -292,20 +408,20 @@ struct DeviceInfo: Decodable {
 }
 
 struct SmartStatus: Decodable {
-    let passed: Bool
+    let passed: Bool?
 }
 
 struct NVMESmartHealthLog: Decodable {
-    let criticalWarning: Int
-    let temperature: Int
-    let availableSpare: Int
-    let percentageUsed: Int
-    let dataUnitsRead: Int
-    let dataUnitsWritten: Int
-    let powerCycles: Int
-    let powerOnHours: Int
-    let unsafeShutdowns: Int
-    let mediaErrors: Int
+    let criticalWarning: Int?
+    let temperature: Int?
+    let availableSpare: Int?
+    let percentageUsed: Int?
+    let dataUnitsRead: Int?
+    let dataUnitsWritten: Int?
+    let powerCycles: Int?
+    let powerOnHours: Int?
+    let unsafeShutdowns: Int?
+    let mediaErrors: Int?
     
     enum CodingKeys: String, CodingKey {
         case criticalWarning = "critical_warning"
@@ -332,6 +448,15 @@ struct StorageDevice: Identifiable, Hashable, Codable {
     let isRemote: Bool
     let address: String?
     let hostId: UUID?
+    
+    static let dashboard = StorageDevice(
+        path: "dashboard",
+        name: "Dashboard",
+        size: "",
+        isRemote: false,
+        address: nil,
+        hostId: nil
+    )
 }
 
 struct RemoteHost: Identifiable, Hashable, Codable {
@@ -352,13 +477,74 @@ class DiskScanManager: ObservableObject {
     @Published var detectedDisks: [StorageDevice] = []
     @Published var remoteHosts: [RemoteHost] = []
     @Published var allDevices: [StorageDevice] = []
+    @Published var hostStatus: [UUID: Bool] = [:]
     
     private let smartctlPath = "/opt/homebrew/bin/smartctl"
+    private var reachabilityTimer: Timer?
     
     init() {
         refreshDiskList()
         loadRemoteHosts()
         updateAllDevices()
+        setupVolumeNotifications()
+        checkAllHostsReachability()
+        startReachabilityTimer()
+    }
+    
+    private func setupVolumeNotifications() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didMountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshDiskList()
+        }
+        
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didUnmountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // Delay refresh by 1.5 seconds to let the macOS kernel fully release the physical dev node descriptor
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self?.refreshDiskList()
+            }
+        }
+    }
+    
+    func startReachabilityTimer() {
+        reachabilityTimer?.invalidate()
+        reachabilityTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.checkAllHostsReachability()
+        }
+    }
+    
+    func verifyReachability(ip: String, port: String) async -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+        let portArg = port.isEmpty ? "22" : port
+        task.arguments = ["-zv", "-w", "2", ip, portArg]
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+    
+    func checkAllHostsReachability() {
+        for host in remoteHosts {
+            Task {
+                let reachable = await verifyReachability(ip: host.ip, port: host.port)
+                await MainActor.run {
+                    self.hostStatus[host.id] = reachable
+                }
+            }
+        }
     }
     
     func refreshDiskList() {
@@ -429,6 +615,10 @@ class DiskScanManager: ObservableObject {
     }
     
     func ejectDevice(devicePath: String) {
+        // Optimistic update: remove from detectedDisks immediately so it vanishes from UI
+        self.detectedDisks.removeAll(where: { $0.path == devicePath })
+        self.updateAllDevices()
+        
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
         task.arguments = ["eject", devicePath]
@@ -436,9 +626,14 @@ class DiskScanManager: ObservableObject {
         do {
             try task.run()
             task.waitUntilExit()
-            refreshDiskList()
+            
+            // Safety refresh after delay to sync with system state
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.refreshDiskList()
+            }
         } catch {
             print("Failed to eject device: \(error)")
+            self.refreshDiskList()
         }
     }
     
@@ -468,12 +663,14 @@ class DiskScanManager: ObservableObject {
         remoteHosts.append(host)
         saveRemoteHosts()
         updateAllDevices()
+        checkAllHostsReachability()
     }
     
     func removeRemoteHost(_ host: RemoteHost) {
         remoteHosts.removeAll(where: { $0.id == host.id })
         saveRemoteHosts()
         updateAllDevices()
+        checkAllHostsReachability()
     }
     
     // MARK: - Real SSH Commands Executor using Expect
@@ -725,55 +922,142 @@ struct ContentView: View {
     @StateObject private var scanManager = DiskScanManager()
     @State private var selectedDevice: StorageDevice?
     @State private var showSettings = false
+    @State private var showExportSheet = false
+    @State private var expandedHosts: Set<UUID> = []
     
     var body: some View {
         NavigationSplitView {
             List(selection: $selectedDevice) {
-                Section("Local Storage") {
-                    ForEach(scanManager.detectedDisks, id: \.self) { device in
-                        NavigationLink(value: device) {
-                            Label {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(device.name)
-                                        .font(.headline)
-                                    Text(device.path)
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                            } icon: {
-                                Image(systemName: device.path == "/dev/disk0" ? "internaldrive" : "externaldrive")
-                                    .imageScale(.large)
-                                    .foregroundColor(device.path == "/dev/disk0" ? .blue : .purple)
-                            }
-                        }
-                    }
+                NavigationLink(value: StorageDevice.dashboard) {
+                    Label("Dashboard", systemImage: "house.fill")
+                        .font(.headline)
                 }
+                .padding(.vertical, 4)
                 
-                // Dynamic Network Hosts from User Configuration
-                ForEach(scanManager.remoteHosts) { host in
-                    Section("Host: \(host.name)") {
-                        ForEach(host.selectedDisks, id: \.self) { diskPath in
-                            let dev = StorageDevice(
-                                path: diskPath,
-                                name: "Disk \(diskPath.components(separatedBy: "/").last ?? diskPath)",
-                                size: "Remote SSH Node",
-                                isRemote: true,
-                                address: host.ip,
-                                hostId: host.id
-                            )
-                            NavigationLink(value: dev) {
+                Section("Devices") {
+                    let localMachineName = Host.current().localizedName ?? "Local Mac"
+                    DisclosureGroup(isExpanded: .constant(true)) {
+                        ForEach(scanManager.detectedDisks, id: \.self) { device in
+                            NavigationLink(value: device) {
                                 Label {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(dev.name)
+                                        Text(device.name)
                                             .font(.headline)
-                                        Text(host.ip)
+                                        Text(device.path)
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                     }
                                 } icon: {
-                                    Image(systemName: "server.rack")
+                                    Image(systemName: device.path == "/dev/disk0" ? "internaldrive" : "externaldrive")
                                         .imageScale(.large)
-                                        .foregroundColor(.teal)
+                                        .foregroundColor(device.path == "/dev/disk0" ? .blue : .purple)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(localMachineName, systemImage: "laptopcomputer")
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                    }
+                }
+                
+                Section(header: HStack {
+                    Text("Remote Hosts")
+                    Spacer()
+                    Button(action: { showSettings.toggle() }) {
+                        Image(systemName: "plus")
+                            .font(.title3)
+                            .foregroundColor(.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Add new remote server")
+                }) {
+                    if scanManager.remoteHosts.isEmpty {
+                        Text("No remote servers")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.leading, 10)
+                    } else {
+                        ForEach(scanManager.remoteHosts) { host in
+                            let isOnline = scanManager.hostStatus[host.id]
+                            DisclosureGroup(isExpanded: Binding(
+                                get: { expandedHosts.contains(host.id) },
+                                set: { isExpanded in
+                                    if isExpanded {
+                                        expandedHosts.insert(host.id)
+                                    } else {
+                                        expandedHosts.remove(host.id)
+                                    }
+                                }
+                            )) {
+                                ForEach(host.selectedDisks, id: \.self) { diskPath in
+                                    let dev = StorageDevice(
+                                        path: diskPath,
+                                        name: "Disk \(diskPath.components(separatedBy: "/").last ?? diskPath)",
+                                        size: "Remote SSH Node",
+                                        isRemote: true,
+                                        address: host.ip,
+                                        hostId: host.id
+                                    )
+                                    NavigationLink(value: dev) {
+                                        Label {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(dev.name)
+                                                    .font(.headline)
+                                                Text(dev.path)
+                                                    .font(.caption)
+                                                    .foregroundColor(.secondary)
+                                            }
+                                        } icon: {
+                                            Image(systemName: "opticaldisk")
+                                                .imageScale(.large)
+                                                .foregroundColor(.teal)
+                                        }
+                                    }
+                                }
+                                .padding(.leading, 10)
+                            } label: {
+                                HStack {
+                                    Label {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(host.name)
+                                                .font(.headline)
+                                            Text("\(host.username)@\(host.ip)")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    } icon: {
+                                        Image(systemName: "server.rack")
+                                            .foregroundColor(.teal)
+                                    }
+                                    
+                                    Spacer()
+                                    
+                                    // Status Dot (Green/Red/Loader)
+                                    if let online = isOnline {
+                                        Circle()
+                                            .fill(online ? Color.green : Color.red)
+                                            .frame(width: 8, height: 8)
+                                            .help(online ? "Online" : "Offline")
+                                    } else {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                            .scaleEffect(0.6)
+                                            .frame(width: 10, height: 10)
+                                    }
+                                    
+                                    // Disconnect Button
+                                    Button(action: {
+                                        scanManager.removeRemoteHost(host)
+                                        if let selected = selectedDevice, selected.hostId == host.id {
+                                            selectedDevice = nil
+                                        }
+                                    }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Disconnect and remove host")
                                 }
                             }
                         }
@@ -794,6 +1078,15 @@ struct ContentView: View {
                     
                     Spacer()
                     
+                    Button(action: { showExportSheet.toggle() }) {
+                        Label("Export", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Export diagnostic reports")
+                    
+                    Spacer()
+                    
                     Button(action: {
                         scanManager.refreshDiskList()
                     }) {
@@ -805,21 +1098,17 @@ struct ContentView: View {
                 }
             }
         } detail: {
-            if let device = selectedDevice {
-                DiskDetailView(device: device, scanManager: scanManager)
+            if let device = selectedDevice, device.path != "dashboard" {
+                DiskDetailView(device: device, scanManager: scanManager, selectedDevice: $selectedDevice)
             } else {
-                VStack(spacing: 15) {
-                    Image(systemName: "opticaldisk")
-                        .font(.system(size: 64))
-                        .foregroundColor(.secondary)
-                    Text("Select a Storage Device to scan")
-                        .font(.title2)
-                        .foregroundColor(.secondary)
-                }
+                WelcomeDashboardView(scanManager: scanManager)
             }
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(selectedTheme: $selectedTheme, scanManager: scanManager)
+        }
+        .sheet(isPresented: $showExportSheet) {
+            ExportReportSheet(scanManager: scanManager)
         }
         .preferredColorScheme(selectedTheme.colorScheme)
     }
@@ -829,6 +1118,7 @@ struct ContentView: View {
 struct DiskDetailView: View {
     let device: StorageDevice
     @ObservedObject var scanManager: DiskScanManager
+    @Binding var selectedDevice: StorageDevice?
     @State private var selectedTab = "overview"
     
     private var deviceKey: String {
@@ -878,6 +1168,7 @@ struct DiskDetailView: View {
                     HStack(spacing: 10) {
                         if !device.isRemote && device.path != "/dev/disk0" {
                             Button(action: {
+                                selectedDevice = nil
                                 scanManager.ejectDevice(devicePath: device.path)
                             }) {
                                 Label("Eject", systemImage: "eject")
@@ -1100,7 +1391,7 @@ struct RealOverviewTab: View {
                 
                 // 2. Remaining Life / SMART Health Status
                 if let log = result.nvmeSmartHealthInformationLog {
-                    let healthPct = 100 - log.percentageUsed
+                    let healthPct = 100 - (log.percentageUsed ?? 0)
                     GridRow {
                         Text("Remaining Life (Health):")
                             .fontWeight(.semibold)
@@ -1113,15 +1404,16 @@ struct RealOverviewTab: View {
                         }
                     }
                 } else if let status = result.smartStatus {
+                    let passed = status.passed ?? false
                     GridRow {
                         Text("SMART Health Status:")
                             .fontWeight(.semibold)
                         HStack {
-                            Text(status.passed ? "PASSED" : "FAILED")
+                            Text(passed ? "PASSED" : "FAILED")
                                 .fontWeight(.bold)
-                                .foregroundColor(status.passed ? .green : .red)
-                            Image(systemName: status.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                .foregroundColor(status.passed ? .green : .red)
+                                .foregroundColor(passed ? .green : .red)
+                            Image(systemName: passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundColor(passed ? .green : .red)
                         }
                     }
                 }
@@ -1149,14 +1441,14 @@ struct RealOverviewTab: View {
                     GridRow {
                         Text("Data Units Written:")
                             .fontWeight(.semibold)
-                        let bytesWritten = Double(log.dataUnitsWritten) * 1000 * 512
+                        let bytesWritten = Double(log.dataUnitsWritten ?? 0) * 1000 * 512
                         let tbWritten = bytesWritten / (1024 * 1024 * 1024 * 1024)
                         Text(String(format: "%.2f TB Written", tbWritten))
                     }
                     GridRow {
                         Text("Data Units Read:")
                             .fontWeight(.semibold)
-                        let bytesRead = Double(log.dataUnitsRead) * 1000 * 512
+                        let bytesRead = Double(log.dataUnitsRead ?? 0) * 1000 * 512
                         let tbRead = bytesRead / (1024 * 1024 * 1024 * 1024)
                         Text(String(format: "%.2f TB Read", tbRead))
                     }
@@ -1176,7 +1468,7 @@ struct RealOverviewTab: View {
                             .font(.caption)
                             .foregroundColor(.green)
                             .fontWeight(.semibold)
-                        Text("However, this specific USB enclosure's bridge chip does not translate S.M.A.T. commands under macOS.")
+                        Text("However, this specific USB enclosure's bridge chip does not translate S.M.A.R.T. commands under macOS.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Text("To read telemetry from this drive, connect it via a Thunderbolt port/enclosure, or use a Linux/Windows host.")
@@ -1190,6 +1482,78 @@ struct RealOverviewTab: View {
             .padding()
             .background(Color(NSColor.controlBackgroundColor))
             .cornerRadius(10)
+            
+            // 7. SSD Lifespan & Wear Projection Card
+            if let wear = result.estimateWear() {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "hourglass.badge.plus")
+                            .font(.title2)
+                            .foregroundColor(.orange)
+                        Text("SSD Lifespan & Wear Projection")
+                            .font(.title3)
+                            .fontWeight(.bold)
+                    }
+                    
+                    Divider()
+                    
+                    Grid(alignment: .leading, horizontalSpacing: 25, verticalSpacing: 10) {
+                        GridRow {
+                            Text("Total Bytes Written:")
+                                .fontWeight(.semibold)
+                            Text(String(format: "%.2f TB (Standard Lifetime: %.0f TBW)", wear.totalTBWritten, wear.standardTBW))
+                        }
+                        GridRow {
+                            Text("Remaining Life Budget:")
+                                .fontWeight(.semibold)
+                            Text(String(format: "%.2f TB remaining", wear.remainingTB))
+                        }
+                        GridRow {
+                            Text("Avg. Daily Write Speed:")
+                                .fontWeight(.semibold)
+                            Text(String(format: "%.2f GB / day", wear.dailyWriteAverageGB))
+                        }
+                        GridRow {
+                            Text("Estimated Lifespan Remaining:")
+                                .fontWeight(.semibold)
+                            if let years = wear.estimatedYearsRemaining {
+                                Text(String(format: "%.1f years", years))
+                                    .fontWeight(.bold)
+                                    .foregroundColor(years > 5 ? .green : (years > 2 ? .orange : .red))
+                            } else {
+                                Text("Calibrating (> 10 years expected)")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        GridRow {
+                            Text("SSD Wear Rating:")
+                                .fontWeight(.semibold)
+                            Text(wear.healthRating)
+                                .fontWeight(.bold)
+                                .foregroundColor(wear.healthRating == "Excellent" ? .green : (wear.healthRating == "Good" ? .blue : (wear.healthRating == "Fair" ? .orange : .red)))
+                        }
+                    }
+                    .font(.body)
+                    
+                    if wear.dailyWriteAverageGB > 40.0 {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                            Text("High write activity detected. Consider closing memory-heavy background tasks to optimize Swap virtualization on macOS.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.top, 5)
+                    }
+                }
+                .padding()
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(10)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+                )
+            }
         }
     }
 }
@@ -1205,23 +1569,28 @@ struct RealMetricsTab: View {
                 .fontWeight(.bold)
             
             if let log = result.nvmeSmartHealthInformationLog {
+                let critWarn = log.criticalWarning ?? 0
+                let availSpare = log.availableSpare ?? 0
+                let unsafeShutdowns = log.unsafeShutdowns ?? 0
+                let mediaErrors = log.mediaErrors ?? 0
+                
                 List {
-                    MetricRow(name: "Critical Warnings", value: "\(log.criticalWarning)", status: log.criticalWarning == 0 ? "Normal" : "WARNING", isWarning: log.criticalWarning > 0)
-                    MetricRow(name: "Available Spare Space", value: "\(log.availableSpare)%", status: log.availableSpare > 10 ? "OK" : "CRITICAL", isWarning: log.availableSpare <= 10)
-                    MetricRow(name: "Unsafe Shutdowns", value: "\(log.unsafeShutdowns)", status: "Informational", isWarning: false)
-                    MetricRow(name: "Media and Data Integrity Errors", value: "\(log.mediaErrors)", status: log.mediaErrors == 0 ? "Normal" : "CRITICAL", isWarning: log.mediaErrors > 0)
+                    MetricRow(name: "Critical Warnings", value: "\(critWarn)", status: critWarn == 0 ? "Normal" : "WARNING", isWarning: critWarn > 0)
+                    MetricRow(name: "Available Spare Space", value: "\(availSpare)%", status: availSpare > 10 ? "OK" : "CRITICAL", isWarning: availSpare <= 10)
+                    MetricRow(name: "Unsafe Shutdowns", value: "\(unsafeShutdowns)", status: "Informational", isWarning: false)
+                    MetricRow(name: "Media and Data Integrity Errors", value: "\(mediaErrors)", status: mediaErrors == 0 ? "Normal" : "CRITICAL", isWarning: mediaErrors > 0)
                 }
                 .frame(height: 250)
                 .cornerRadius(10)
-            } else if let ata = result.ataSmartAttributes {
-                Table(ata.table) {
+            } else if let ata = result.ataSmartAttributes, let table = ata.table {
+                Table(table) {
                     TableColumn("ID") { attr in
-                        Text("\(attr.id)")
+                        Text("\(attr.id ?? 0)")
                     }
                     .width(min: 30, max: 40)
                     
                     TableColumn("Attribute Name") { attr in
-                        Text(attr.name)
+                        Text(attr.name ?? "Unknown")
                             .fontWeight(.medium)
                     }
                     .width(min: 150, max: 220)
@@ -1451,6 +1820,58 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Network Hosts (SSH)", systemImage: "network")
                 }
+                
+                // TAB 3: About App & Credits
+                VStack(spacing: 15) {
+                    Spacer()
+                    
+                    Image(systemName: "gauge.extension.shortcut.minimize")
+                        .font(.system(size: 48))
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [.blue, .purple],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                    
+                    Text("SmartMac")
+                        .font(.title)
+                        .fontWeight(.bold)
+                    
+                    Text("Version 1.0.0")
+                        .font(.headline)
+                        .foregroundColor(.secondary)
+                    
+                    Text("S.M.A.R.T. Diagnostics & Telemetry Dashboard")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        
+                    Divider()
+                        .frame(width: 200)
+                        .padding(.vertical, 5)
+                    
+                    VStack(spacing: 4) {
+                        Text("Designed & Programmed by")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        
+                        Text("Humberto Barchini (HB) & Antigravity (AGY)")
+                            .font(.body)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.primary)
+                    }
+                    
+                    Text("© 2026. All rights reserved.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    
+                    Spacer()
+                }
+                .tabItem {
+                    Label("About", systemImage: "info.circle")
+                }
             }
             .padding(.bottom, 10)
             
@@ -1517,6 +1938,943 @@ struct SettingsView: View {
         discoveredDisks = []
         selectedDisks = []
         discoveryError = nil
+    }
+}
+
+// MARK: - Welcome Dashboard View
+struct WelcomeDashboardView: View {
+    @ObservedObject var scanManager: DiskScanManager
+    
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 30) {
+                // Header / Branding
+                VStack(spacing: 12) {
+                    Image(systemName: "gauge.extension.shortcut.minimize")
+                        .font(.system(size: 72))
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [.blue, .purple],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .padding(.bottom, 5)
+                    
+                    Text("SmartMac")
+                        .font(.system(size: 40, weight: .bold, design: .rounded))
+                    
+                    Text("S.M.A.R.T. Telemetry")
+                        .font(.title3)
+                        .foregroundColor(.secondary)
+                        .fontWeight(.medium)
+                }
+                .padding(.top, 40)
+                
+                // Status / System Summary Cards
+                let localMachineName = Host.current().localizedName ?? "Local Mac"
+                HStack(spacing: 20) {
+                    // Mac Name Card
+                    VStack(alignment: .leading, spacing: 8) {
+                        Image(systemName: "laptopcomputer")
+                            .font(.title)
+                            .foregroundColor(.blue)
+                        Text("Local System")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text(localMachineName)
+                            .font(.headline)
+                            .lineLimit(1)
+                    }
+                    .padding()
+                    .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(10)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    )
+                    
+                    // Local Storage Card
+                    VStack(alignment: .leading, spacing: 8) {
+                        Image(systemName: "internaldrive.fill")
+                            .font(.title)
+                            .foregroundColor(.purple)
+                        Text("Local Storage")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("\(scanManager.detectedDisks.count) Physical \(scanManager.detectedDisks.count == 1 ? "Drive" : "Drives")")
+                            .font(.headline)
+                    }
+                    .padding()
+                    .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(10)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    )
+                    
+                    // Remote Hosts Card
+                    VStack(alignment: .leading, spacing: 8) {
+                        Image(systemName: "server.rack")
+                            .font(.title)
+                            .foregroundColor(.teal)
+                        Text("Network Hosts")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("\(scanManager.remoteHosts.count) SSH \(scanManager.remoteHosts.count == 1 ? "Host" : "Hosts")")
+                            .font(.headline)
+                    }
+                    .padding()
+                    .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(10)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    )
+                }
+                .padding(.horizontal)
+                
+                // Feature list / Quick Guide
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Features & Quick Guide")
+                        .font(.headline)
+                        .padding(.bottom, 5)
+                    
+                    HStack(alignment: .top, spacing: 15) {
+                        Image(systemName: "magnifyingglass.circle.fill")
+                            .font(.title)
+                            .foregroundColor(.blue)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Scan Physical Drives")
+                                .fontWeight(.semibold)
+                            Text("Select any local physical SSD or remote storage node from the sidebar to retrieve S.M.A.R.T. diagnostics, write logs, and lifespans.")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    HStack(alignment: .top, spacing: 15) {
+                        Image(systemName: "network.badge.shield.half.filled")
+                            .font(.title)
+                            .foregroundColor(.teal)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Remote SSH Monitoring")
+                                .fontWeight(.semibold)
+                            Text("Easily check the status of remote systems (e.g. Linux servers, NAS) over secure SSH on Port 22. Online statuses check dynamically in background.")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    HStack(alignment: .top, spacing: 15) {
+                        Image(systemName: "usb.and.pc")
+                            .font(.title)
+                            .foregroundColor(.purple)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Dynamic USB Support")
+                                .fontWeight(.semibold)
+                            Text("Plug in any external USB drive to see it appear on the sidebar immediately. Safe ejection (Eject button) helps unmount nodes securely.")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(10)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                )
+                .padding(.horizontal)
+            }
+            .padding(.bottom, 40)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Export Formats and Helpers
+enum ExportFormat: String, CaseIterable, Identifiable {
+    case markdown = "Markdown (.md)"
+    case pdf = "PDF Document (.pdf)"
+    case word = "Word Document (.doc)"
+    case excel = "Excel/CSV (.csv)"
+    
+    var id: String { self.rawValue }
+}
+
+func generateConsolidatedMarkdownReport(devices: [StorageDevice], scanManager: DiskScanManager, dateStr: String) -> String {
+    var md = """
+    ==================================================
+    ⚡ SmartMac — S.M.A.R.T. Storage Telemetry
+    Consolidated Diagnostic Report
+    ==================================================
+    - **Date Generated:** \(dateStr)
+    - **Devices Reported:** \(devices.count)
+    
+    ==================================================
+    
+    """
+    
+    for device in devices {
+        let key = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+        let output = scanManager.scanResults[key]
+        let hostInfo = device.isRemote ? "Remote Host: \(scanManager.remoteHosts.first(where: { $0.id == device.hostId })?.name ?? "Remote") (IP: \(device.address ?? ""))" : "Local Machine (\(Host.current().localizedName ?? "Local Mac"))"
+        
+        let tech = output?.storageTechnology ?? "Solid State / Flash Storage"
+        let sectorSize = (output?.logicalBlockSize != nil) ? "\(output?.logicalBlockSize ?? 0) bytes logical, \(output?.physicalBlockSize ?? 0) bytes physical" : "N/A"
+        let capacity = output?.userCapacity?.text ?? "N/A"
+        let smartStatusStr = (output?.smartSupport?.available == true) ? "Supported, \(output?.smartSupport?.enabled == true ? "Enabled" : "Disabled")" : "N/A"
+        
+        md += "## Device: \(output?.modelName ?? device.name) (\(device.path))\n"
+        md += "- **Location:** \(hostInfo)\n"
+        md += "- **Storage Technology:** \(tech)\n"
+        md += "- **Formatted Capacity:** \(capacity)\n"
+        md += "- **Serial Number:** \(output?.serialNumber ?? "N/A")\n"
+        md += "- **Firmware Version:** \(output?.firmwareVersion ?? "N/A")\n"
+        md += "- **Connection Protocol:** \(output?.device?.protocolName ?? (device.isRemote ? "Remote SSH" : "Local Direct"))\n"
+        md += "- **Sector Sizes:** \(sectorSize)\n"
+        md += "- **S.M.A.R.T. Compliance:** \(smartStatusStr)\n\n"
+        
+        if let result = output {
+            let diagnosis = result.runDiagnosis()
+            md += "### Health Assessment\n"
+            md += "- **Status:** **\(diagnosis.status.rawValue.uppercased())**\n"
+            md += "- **Message:** \(diagnosis.message)\n"
+            
+            if let temp = result.temperature?.current {
+                md += "- **Temperature:** \(temp) °C\n"
+            }
+            
+            if let log = result.nvmeSmartHealthInformationLog {
+                let healthPct = 100 - (log.percentageUsed ?? 0)
+                let tbWritten = Double(log.dataUnitsWritten ?? 0) * 1000 * 512 / (1024*1024*1024*1024)
+                let tbRead = Double(log.dataUnitsRead ?? 0) * 1000 * 512 / (1024*1024*1024*1024)
+                md += """
+                - **Remaining Life (Health):** \(healthPct)%
+                - **Data Written:** \(String(format: "%.2f TB", tbWritten))
+                - **Data Read:** \(String(format: "%.2f TB", tbRead))
+                - **Power On Hours:** \(log.powerOnHours ?? 0) hours
+                - **Power Cycles:** \(log.powerCycles ?? 0)
+                - **Unsafe Shutdowns:** \(log.unsafeShutdowns ?? 0)
+                - **Media Errors:** \(log.mediaErrors ?? 0)
+                
+                """
+            } else if let hours = result.powerOnTime?.hours {
+                md += "- **Power On Hours:** \(hours) hours\n\n"
+            }
+            
+            if let wear = result.estimateWear() {
+                md += "### SSD Lifespan & Wear Projection\n"
+                md += "- **Total Bytes Written:** \(String(format: "%.2f TB", wear.totalTBWritten)) (Standard Lifetime: \(String(format: "%.0f TBW", wear.standardTBW)))\n"
+                md += "- **Remaining Budget:** \(String(format: "%.2f TB remaining", wear.remainingTB))\n"
+                md += "- **Avg. Daily Write Speed:** \(String(format: "%.2f GB / day", wear.dailyWriteAverageGB))\n"
+                if let years = wear.estimatedYearsRemaining {
+                    md += "- **Estimated Lifespan:** \(String(format: "%.1f years remaining", years))\n"
+                } else {
+                    md += "- **Estimated Lifespan:** Calibrating (> 10 years expected)\n"
+                }
+                md += "- **SSD Wear Rating:** \(wear.healthRating)\n\n"
+            }
+            
+            if let ata = result.ataSmartAttributes, let table = ata.table {
+                md += "### S.M.A.R.T. Attributes (SATA)\n"
+                md += "| ID | Attribute Name | Value | Worst | Thresh | Raw Value |\n"
+                md += "|---|---|---|---|---|---|\n"
+                for attr in table {
+                    md += "| \(attr.id ?? 0) | \(attr.name ?? "Unknown") | \(attr.value.map { "\($0)" } ?? "-") | \(attr.worst.map { "\($0)" } ?? "-") | \(attr.threshold.map { "\($0)" } ?? "-") | \(attr.raw?.string ?? "-") |\n"
+                }
+                md += "\n"
+            }
+        }
+        md += "\n---\n\n"
+    }
+    return md
+}
+
+func generateCSVReport(devices: [StorageDevice], scanManager: DiskScanManager) -> String {
+    var csv = "Device Path,Host,Model Name,Serial Number,Health Status,Temperature (C),Remaining Life (%),Power On Hours,Data Written (TB),Media Errors\n"
+    
+    for device in devices {
+        let key = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+        let output = scanManager.scanResults[key]
+        let hostName = device.isRemote ? (device.address ?? "Remote") : "Local Mac"
+        let model = output?.modelName ?? device.name
+        let serial = output?.serialNumber ?? "N/A"
+        let diagnosis = output?.runDiagnosis()
+        let status = diagnosis?.status.rawValue.uppercased() ?? "UNKNOWN"
+        let temp = output?.temperature?.current.map { "\($0)" } ?? ""
+        
+        var life = ""
+        var hours = ""
+        var written = ""
+        var mediaErrors = ""
+        
+        if let log = output?.nvmeSmartHealthInformationLog {
+            life = "\(100 - (log.percentageUsed ?? 0))"
+            hours = "\(log.powerOnHours ?? 0)"
+            written = String(format: "%.2f", Double(log.dataUnitsWritten ?? 0) * 1000 * 512 / (1024*1024*1024*1024))
+            mediaErrors = "\(log.mediaErrors ?? 0)"
+        } else if let hoursVal = output?.powerOnTime?.hours {
+            hours = "\(hoursVal)"
+        }
+        
+        let cleanModel = model.replacingOccurrences(of: ",", with: " ")
+        csv += "\(device.path),\(hostName),\(cleanModel),\(serial),\(status),\(temp),\(life),\(hours),\(written),\(mediaErrors)\n"
+    }
+    
+    return csv
+}
+
+func generateConsolidatedWordHTMLReport(devices: [StorageDevice], scanManager: DiskScanManager, dateStr: String) -> String {
+    var html = """
+    <html>
+    <head>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; color: #333; }
+        h1 { color: #004085; border-bottom: 2px solid #004085; padding-bottom: 10px; }
+        h2 { color: #17a2b8; margin-top: 30px; page-break-before: always; }
+        h2:first-of-type { page-break-before: avoid; }
+        table { border-collapse: collapse; width: 100%; margin-top: 15px; }
+        th, td { border: 1px solid #dee2e6; padding: 10px; text-align: left; }
+        th { background-color: #f8f9fa; font-weight: bold; }
+        .status-badge { display: inline-block; padding: 6px 12px; color: white; background-color: #000; font-weight: bold; border-radius: 4px; }
+    </style>
+    </head>
+    <body>
+        <div style="background: linear-gradient(135deg, #004085, #17a2b8); color: white; padding: 25px; border-radius: 8px; margin-bottom: 25px; text-align: center;">
+            <h1 style="margin: 0; font-size: 28px; border: none; color: white; padding: 0;">SmartMac</h1>
+            <p style="margin: 5px 0 0 0; font-size: 16px; opacity: 0.9;">S.M.A.R.T. Storage Telemetry & Consolidated Diagnostics</p>
+        </div>
+        <p><strong>Date Generated:</strong> \(dateStr)</p>
+        <p><strong>Devices Included:</strong> \(devices.count)</p>
+    """
+    
+    for device in devices {
+        let key = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+        let output = scanManager.scanResults[key]
+        let model = output?.modelName ?? device.name
+        let serial = output?.serialNumber ?? "N/A"
+        let firmware = output?.firmwareVersion ?? "N/A"
+        let proto = output?.device?.protocolName ?? (device.isRemote ? "Remote SSH" : "Local Direct")
+        let diagnosis = output?.runDiagnosis()
+        let status = diagnosis?.status.rawValue.uppercased() ?? "UNKNOWN"
+        let statusColor = status == "HEALTHY" ? "#28a745" : (status == "WARNING" ? "#ffc107" : "#dc3545")
+        let hostInfo = device.isRemote ? "Remote Host: \(scanManager.remoteHosts.first(where: { $0.id == device.hostId })?.name ?? "Remote") (IP: \(device.address ?? ""))" : "Local Machine (\(Host.current().localizedName ?? "Local Mac"))"
+        
+        let tech = output?.storageTechnology ?? "Solid State / Flash Storage"
+        let sectorSize = (output?.logicalBlockSize != nil) ? "\(output?.logicalBlockSize ?? 0) bytes logical, \(output?.physicalBlockSize ?? 0) bytes physical" : "N/A"
+        let capacity = output?.userCapacity?.text ?? "N/A"
+        let smartStatusStr = (output?.smartSupport?.available == true) ? "Supported, \(output?.smartSupport?.enabled == true ? "Enabled" : "Disabled")" : "N/A"
+        
+        html += """
+        <h2>Device: \(model) (\(device.path))</h2>
+        <p><strong>Location:</strong> \(hostInfo)</p>
+        
+        <h3>Device Specifications</h3>
+        <table>
+            <tr><th>Property</th><th>Value</th></tr>
+            <tr><td>Device Path</td><td>\(device.path)</td></tr>
+            <tr><td>Model Name</td><td>\(model)</td></tr>
+            <tr><td>Storage Technology</td><td>\(tech)</td></tr>
+            <tr><td>Formatted Capacity</td><td>\(capacity)</td></tr>
+            <tr><td>Serial Number</td><td>\(serial)</td></tr>
+            <tr><td>Firmware Version</td><td>\(firmware)</td></tr>
+            <tr><td>Connection Protocol</td><td>\(proto)</td></tr>
+            <tr><td>Sector Sizes</td><td>\(sectorSize)</td></tr>
+            <tr><td>S.M.A.R.T. Compliance</td><td>\(smartStatusStr)</td></tr>
+        </table>
+        
+        <h3>Health Overview</h3>
+        <p><strong>Status:</strong> <span class="status-badge" style="background-color: \(statusColor); color: white;">\(status)</span></p>
+        """
+        
+        if let diag = diagnosis {
+            html += "<p><strong>Diagnosis Detail:</strong> \(diag.message)</p>"
+        }
+        
+        if let result = output {
+            if let temp = result.temperature?.current {
+                html += "<p><strong>Current Temperature:</strong> \(temp) &deg;C</p>"
+            }
+            
+            if let log = result.nvmeSmartHealthInformationLog {
+                let healthPct = 100 - (log.percentageUsed ?? 0)
+                let tbWritten = Double(log.dataUnitsWritten ?? 0) * 1000 * 512 / (1024*1024*1024*1024)
+                let tbRead = Double(log.dataUnitsRead ?? 0) * 1000 * 512 / (1024*1024*1024*1024)
+                html += """
+                <h3>Detailed Telemetry (NVMe)</h3>
+                <table>
+                    <tr><th>Metric</th><th>Value</th></tr>
+                    <tr><td>Remaining Life</td><td>\(healthPct)%</td></tr>
+                    <tr><td>Data Written</td><td>\(String(format: "%.2f TB", tbWritten))</td></tr>
+                    <tr><td>Data Read</td><td>\(String(format: "%.2f TB", tbRead))</td></tr>
+                    <tr><td>Power Cycles</td><td>\(log.powerCycles ?? 0)</td></tr>
+                    <tr><td>Power On Hours</td><td>\(log.powerOnHours ?? 0) hours</td></tr>
+                    <tr><td>Unsafe Shutdowns</td><td>\(log.unsafeShutdowns ?? 0)</td></tr>
+                    <tr><td>Media Errors</td><td>\(log.mediaErrors ?? 0)</td></tr>
+                </table>
+                """
+            }
+            
+            if let wear = result.estimateWear() {
+                html += """
+                <h3>SSD Lifespan & Wear Projection</h3>
+                <table>
+                    <tr><th>Metric</th><th>Value</th></tr>
+                    <tr><td>Total Bytes Written</td><td>\(String(format: "%.2f TB", wear.totalTBWritten)) (Standard Lifetime: \(String(format: "%.0f TBW", wear.standardTBW)))</td></tr>
+                    <tr><td>Remaining Budget</td><td>\(String(format: "%.2f TB remaining", wear.remainingTB))</td></tr>
+                    <tr><td>Avg. Daily Write Speed</td><td>\(String(format: "%.2f GB / day", wear.dailyWriteAverageGB))</td></tr>
+                    <tr><td>Estimated Lifespan</td><td>\(wear.estimatedYearsRemaining.map { String(format: "%.1f years remaining", $0) } ?? "Calibrating (> 10 years expected)")</td></tr>
+                    <tr><td>SSD Wear Rating</td><td>\(wear.healthRating)</td></tr>
+                </table>
+                """
+            }
+            
+            if let ata = result.ataSmartAttributes, let table = ata.table {
+                html += """
+                <h3>S.M.A.R.T. Attributes (SATA)</h3>
+                <table>
+                    <tr><th>ID</th><th>Attribute Name</th><th>Value</th><th>Worst</th><th>Threshold</th><th>Raw Value</th></tr>
+                """
+                for attr in table {
+                    html += """
+                    <tr>
+                        <td>\(attr.id ?? 0)</td>
+                        <td>\(attr.name ?? "Unknown")</td>
+                        <td>\(attr.value.map { "\($0)" } ?? "-")</td>
+                        <td>\(attr.worst.map { "\($0)" } ?? "-")</td>
+                        <td>\(attr.threshold.map { "\($0)" } ?? "-")</td>
+                        <td>\(attr.raw?.string ?? "-")</td>
+                    </tr>
+                    """
+                }
+                html += "</table>"
+            }
+        }
+    }
+    
+    html += """
+    </body>
+    </html>
+    """
+    
+    return html
+}
+
+// MARK: - Single Report PDF View Component (For Multi-page PDF generation)
+struct SingleReportPDFView: View {
+    let device: StorageDevice
+    let output: SmartctlOutput?
+    let scanManager: DiskScanManager
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 15) {
+                Image(systemName: "gauge.extension.shortcut.minimize")
+                    .font(.system(size: 40))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [.blue, .purple],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SmartMac")
+                        .font(.title)
+                        .fontWeight(.bold)
+                    Text("S.M.A.R.T. Storage Telemetry")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("Diagnostic Report")
+                        .font(.headline)
+                        .foregroundColor(.blue)
+                    Text("Consolidated Document")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.bottom, 5)
+            
+            Divider()
+            
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Device Specifications")
+                    .font(.headline)
+                
+                let hostInfo = device.isRemote ? "Remote Host: \(scanManager.remoteHosts.first(where: { $0.id == device.hostId })?.name ?? "Remote") (IP: \(device.address ?? ""))" : "Local Machine (\(Host.current().localizedName ?? "Local Mac"))"
+                let tech = output?.storageTechnology ?? "Solid State / Flash Storage"
+                let sectorSize = (output?.logicalBlockSize != nil) ? "\(output?.logicalBlockSize ?? 0) bytes logical, \(output?.physicalBlockSize ?? 0) bytes physical" : "N/A"
+                let capacity = output?.userCapacity?.text ?? "N/A"
+                let smartStatusStr = (output?.smartSupport?.available == true) ? "Supported, \(output?.smartSupport?.enabled == true ? "Enabled" : "Disabled")" : "N/A"
+                
+                Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
+                    GridRow {
+                        Text("Location:")
+                            .fontWeight(.semibold)
+                        Text(hostInfo)
+                    }
+                    GridRow {
+                        Text("Device Path:")
+                            .fontWeight(.semibold)
+                        Text(device.path)
+                    }
+                    GridRow {
+                        Text("Model Name:")
+                            .fontWeight(.semibold)
+                        Text(output?.modelName ?? device.name)
+                    }
+                    GridRow {
+                        Text("Storage Tech:")
+                            .fontWeight(.semibold)
+                        Text(tech)
+                    }
+                    GridRow {
+                        Text("Formatted Cap:")
+                            .fontWeight(.semibold)
+                        Text(capacity)
+                    }
+                    GridRow {
+                        Text("Serial Number:")
+                            .fontWeight(.semibold)
+                        Text(output?.serialNumber ?? "N/A")
+                    }
+                    GridRow {
+                        Text("Firmware Ver:")
+                            .fontWeight(.semibold)
+                        Text(output?.firmwareVersion ?? "N/A")
+                    }
+                    GridRow {
+                        Text("Sector Sizes:")
+                            .fontWeight(.semibold)
+                        Text(sectorSize)
+                    }
+                    GridRow {
+                        Text("SMART Support:")
+                            .fontWeight(.semibold)
+                        Text(smartStatusStr)
+                    }
+                }
+                .font(.subheadline)
+            }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+            
+            if let result = output {
+                let diagnosis = result.runDiagnosis()
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Health Assessment")
+                        .font(.headline)
+                    HStack {
+                        Text("Overall Status:")
+                            .fontWeight(.semibold)
+                        Text(diagnosis.status.rawValue.uppercased())
+                            .fontWeight(.bold)
+                            .foregroundColor(diagnosis.status == .healthy ? .green : .red)
+                    }
+                    Text(diagnosis.message)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .padding()
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(8)
+                
+                if let log = result.nvmeSmartHealthInformationLog {
+                    let healthPct = 100 - (log.percentageUsed ?? 0)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Detailed Telemetry (NVMe)")
+                            .font(.headline)
+                        Grid(alignment: .leading, horizontalSpacing: 25, verticalSpacing: 6) {
+                            GridRow {
+                                Text("Remaining Life:")
+                                    .fontWeight(.semibold)
+                                Text("\(healthPct)%")
+                            }
+                            GridRow {
+                                Text("Data Written:")
+                                    .fontWeight(.semibold)
+                                let tbWritten = Double(log.dataUnitsWritten ?? 0) * 1000 * 512 / (1024*1024*1024*1024)
+                                Text(String(format: "%.2f TB", tbWritten))
+                            }
+                            GridRow {
+                                Text("Power On Hours:")
+                                    .fontWeight(.semibold)
+                                Text("\(log.powerOnHours ?? 0) hours")
+                            }
+                        }
+                    }
+                    .padding()
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                }
+                
+                if let wear = result.estimateWear() {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("SSD Lifespan & Wear Projection")
+                            .font(.headline)
+                        Grid(alignment: .leading, horizontalSpacing: 25, verticalSpacing: 6) {
+                            GridRow {
+                                Text("Total Written:")
+                                    .fontWeight(.semibold)
+                                Text(String(format: "%.2f TB (Standard Lifetime: %.0f TBW)", wear.totalTBWritten, wear.standardTBW))
+                            }
+                            GridRow {
+                                Text("Remaining Budget:")
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.2f TB remaining", wear.remainingTB))
+                            }
+                            GridRow {
+                                Text("Avg. Daily Writes:")
+                                    .fontWeight(.semibold)
+                                Text(String(format: "%.2f GB / day", wear.dailyWriteAverageGB))
+                            }
+                            GridRow {
+                                Text("Estimated Lifespan:")
+                                    .fontWeight(.semibold)
+                                if let years = wear.estimatedYearsRemaining {
+                                    Text(String(format: "%.1f years", years))
+                                        .fontWeight(.bold)
+                                        .foregroundColor(years > 5 ? .green : .orange)
+                                } else {
+                                    Text("Calibrating (> 10 years expected)")
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    .padding()
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Health Assessment")
+                        .font(.headline)
+                    Text("STATUS: NOT SCANNED")
+                        .fontWeight(.bold)
+                        .foregroundColor(.secondary)
+                    Text("No S.M.A.R.T. scan was executed for this device in the current session.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .padding()
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(8)
+            }
+            Spacer()
+        }
+        .padding(40)
+        .frame(width: 612, height: 792)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+}
+
+// MARK: - Export Modal Sheet
+struct ExportReportSheet: View {
+    @Environment(\.dismiss) var dismiss
+    @ObservedObject var scanManager: DiskScanManager
+    
+    @State private var selectedDevices: Set<String> = []
+    @State private var exportFormat: ExportFormat = .markdown
+    @State private var isExporting = false
+    @State private var exportStatusMessage: String?
+    
+    private var totalScannedCount: Int {
+        return scanManager.allDevices.filter { device in
+            let key = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+            return scanManager.scanResults[key] != nil
+        }.count
+    }
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Export Diagnostic Reports")
+                .font(.title)
+                .fontWeight(.bold)
+            
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("1. Select Storage Devices to Include:")
+                        .font(.headline)
+                    Spacer()
+                    if totalScannedCount > 0 {
+                        Button("Select All") {
+                            let scannedIds = scanManager.allDevices.filter { device in
+                                let key = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+                                return scanManager.scanResults[key] != nil
+                            }.map { $0.id }
+                            selectedDevices = Set(scannedIds)
+                        }
+                        .buttonStyle(.link)
+                        
+                        Text("|")
+                            .foregroundColor(.secondary)
+                        
+                        Button("Deselect All") {
+                            selectedDevices.removeAll()
+                        }
+                        .buttonStyle(.link)
+                    }
+                }
+                
+                if totalScannedCount == 0 {
+                    VStack(spacing: 15) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 40))
+                            .foregroundColor(.orange)
+                        Text("No Scanned Drives Found")
+                            .font(.headline)
+                        Text("Please select a drive from the sidebar, run a 'Scan Now' diagnostic, and return here to export its report.")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    )
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 15) {
+                            // Local System Node
+                            let localMachineName = Host.current().localizedName ?? "Local Mac"
+                            let localScanned = scanManager.detectedDisks.filter { device in
+                                let key = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+                                return scanManager.scanResults[key] != nil
+                            }
+                            
+                            if !localScanned.isEmpty {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Label(localMachineName, systemImage: "laptopcomputer")
+                                        .font(.headline)
+                                        .foregroundColor(.primary)
+                                    
+                                    ForEach(localScanned) { device in
+                                        deviceRow(device)
+                                    }
+                                }
+                                .padding(.leading, 5)
+                            }
+                            
+                            // Remote Servers Nodes
+                            ForEach(scanManager.remoteHosts) { host in
+                                let remoteScanned = scanManager.allDevices.filter { device in
+                                    device.hostId == host.id && scanManager.scanResults["\(host.id.uuidString)-\(device.path)"] != nil
+                                }
+                                
+                                if !remoteScanned.isEmpty {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Label("\(host.name) (\(host.ip))", systemImage: "server.rack")
+                                            .font(.headline)
+                                            .foregroundColor(.teal)
+                                        
+                                        ForEach(remoteScanned) { device in
+                                            deviceRow(device)
+                                        }
+                                    }
+                                    .padding(.leading, 5)
+                                    .padding(.top, 5)
+                                }
+                            }
+                        }
+                        .padding(10)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    )
+                }
+            }
+            
+            VStack(alignment: .leading, spacing: 8) {
+                Text("2. Choose Export Format:")
+                    .font(.headline)
+                
+                Picker("", selection: $exportFormat) {
+                    ForEach(ExportFormat.allCases) { format in
+                        Text(format.rawValue).tag(format)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .horizontalRadioGroupLayout()
+            }
+            
+            if let msg = exportStatusMessage {
+                Text(msg)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.vertical, 5)
+            }
+            
+            HStack {
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                
+                Spacer()
+                
+                Button(action: {
+                    exportReports()
+                }) {
+                    if isExporting {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text("Choose Folder & Export")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedDevices.isEmpty || isExporting || totalScannedCount == 0)
+            }
+        }
+        .padding()
+        // Resizable constraints
+        .frame(minWidth: 550, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
+    }
+    
+    private func deviceRow(_ device: StorageDevice) -> some View {
+        HStack {
+            Toggle(isOn: Binding(
+                get: { selectedDevices.contains(device.id) },
+                set: { isSelected in
+                    if isSelected {
+                        selectedDevices.insert(device.id)
+                    } else {
+                        selectedDevices.remove(device.id)
+                    }
+                }
+            )) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(device.name)
+                            .fontWeight(.medium)
+                        Text(device.path)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: device.path == "/dev/disk0" ? "internaldrive" : "externaldrive")
+                        .foregroundColor(device.path == "/dev/disk0" ? .blue : .purple)
+                }
+            }
+            .padding(.leading, 15)
+        }
+    }
+    
+    private func exportReports() {
+        let openPanel = NSOpenPanel()
+        openPanel.canChooseFiles = false
+        openPanel.canChooseDirectories = true
+        openPanel.allowsMultipleSelection = false
+        openPanel.title = "Select Export Destination Folder"
+        openPanel.prompt = "Select Folder"
+        
+        openPanel.begin { response in
+            if response == .OK, let folderURL = openPanel.url {
+                isExporting = true
+                exportStatusMessage = "Generating consolidated report..."
+                
+                let devicesToExport = scanManager.allDevices.filter { selectedDevices.contains($0.id) }
+                let formatter = DateFormatter()
+                formatter.dateFormat = "dd-MM-yyyy"
+                let dateStr = formatter.string(from: Date())
+                
+                Task {
+                    let baseName = "SmartMac_Diagnostic_Report_\(dateStr)"
+                    var success = false
+                    
+                    do {
+                        switch exportFormat {
+                        case .markdown:
+                            let content = generateConsolidatedMarkdownReport(devices: devicesToExport, scanManager: scanManager, dateStr: dateStr)
+                            let fileURL = folderURL.appendingPathComponent("\(baseName).md")
+                            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+                            success = true
+                            
+                        case .word:
+                            let content = generateConsolidatedWordHTMLReport(devices: devicesToExport, scanManager: scanManager, dateStr: dateStr)
+                            let fileURL = folderURL.appendingPathComponent("\(baseName).doc")
+                            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+                            success = true
+                            
+                        case .excel:
+                            let content = generateCSVReport(devices: devicesToExport, scanManager: scanManager)
+                            let fileURL = folderURL.appendingPathComponent("\(baseName).csv")
+                            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+                            success = true
+                            
+                        case .pdf:
+                            let fileURL = folderURL.appendingPathComponent("\(baseName).pdf")
+                            await saveAsConsolidatedPDF(devices: devicesToExport, url: fileURL)
+                            success = true
+                        }
+                    } catch {
+                        print("Failed to export: \(error)")
+                    }
+                    
+                    await MainActor.run {
+                        isExporting = false
+                        if success {
+                            exportStatusMessage = "Successfully exported consolidated report!"
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                dismiss()
+                            }
+                        } else {
+                            exportStatusMessage = "Failed to generate report. Please try again."
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @MainActor
+    private func saveAsConsolidatedPDF(devices: [StorageDevice], url: URL) async {
+        let width: CGFloat = 612
+        let height: CGFloat = 792
+        
+        var box = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+        guard let pdfContext = CGContext(url as CFURL, mediaBox: &box, nil) else {
+            return
+        }
+        
+        for device in devices {
+            let key = "\(device.hostId?.uuidString ?? "local")-\(device.path)"
+            let output = scanManager.scanResults[key]
+            
+            let pdfView = SingleReportPDFView(device: device, output: output, scanManager: scanManager)
+            let renderer = ImageRenderer(content: pdfView)
+            
+            pdfContext.beginPDFPage(nil)
+            renderer.render { size, context in
+                context(pdfContext)
+            }
+            pdfContext.endPDFPage()
+        }
+        pdfContext.closePDF()
     }
 }
 
